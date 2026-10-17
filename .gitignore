@@ -1,0 +1,26 @@
+# Binaries
+/senseguard
+*.exe
+*.test
+coverage.out
+
+# Secrets and local data
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Operating system files and caches
+.DS_Store
+/Microsoft/
+
+# Local backups and release artifacts
+/SenseGuard-audit-*/
+/SenseGuard-backup-*/
+/SenseGuard-pre-sqlite-*/
+/SenseGuard-deployment-package-*.zip
+/SenseGuard-release-*.zip
+*.before-database-config
+*.before-sqlite
+*.db-journal

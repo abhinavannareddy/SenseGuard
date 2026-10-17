@@ -1,0 +1,41 @@
+services:
+  opa:
+    image: openpolicyagent/opa:1.0.0
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/senseguard.rego"]
+    volumes:
+      - ./policy:/policy:ro
+    ports:
+      - "127.0.0.1:8181:8181"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "--format", "raw", "true"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  senseguard:
+    build: .
+    image: senseguard:local
+    environment:
+      OPA_URL: http://opa:8181
+      DEFAULT_PRIVACY_BUDGET: "5"
+      REQUEST_PRIVACY_COST: "1"
+      COARSE_GRID_SIZE: "10"
+      NOISE_SCALE: "3"
+      DATABASE_PATH: /data/senseguard.db
+    volumes:
+      - senseguard-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      opa:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  senseguard-data:

@@ -1,0 +1,437 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type SensingData struct {
+	ObjectID string  `json:"object_id"`
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+	Type     string  `json:"type"`
+}
+
+type Config struct {
+	DatabasePath  string
+	OPAURL        string
+	DefaultBudget float64
+	RequestCost   float64
+	GridSize      float64
+	NoiseScale    float64
+}
+
+type App struct {
+	cfg    Config
+	ledger *BudgetLedger
+	data   []SensingData
+	rng    *rand.Rand
+	rngMu  sync.Mutex
+	client *http.Client
+}
+
+func NewApp(cfg Config) (*App, error) {
+	if !finitePositive(cfg.DefaultBudget) {
+		cfg.DefaultBudget = 5
+	}
+	if !finitePositive(cfg.RequestCost) {
+		cfg.RequestCost = 1
+	}
+	if !finitePositive(cfg.GridSize) || cfg.GridSize < 1e-6 || cfg.GridSize > 1e6 {
+		cfg.GridSize = 10
+	}
+	if !finitePositive(cfg.NoiseScale) || cfg.NoiseScale < 1e-9 || cfg.NoiseScale > 1e6 {
+		cfg.NoiseScale = 3
+	}
+	if strings.TrimSpace(cfg.DatabasePath) == "" {
+		cfg.DatabasePath = filepath.Join("data", "senseguard.db")
+	}
+	ledger, err := OpenBudgetLedger(cfg.DatabasePath, cfg.DefaultBudget)
+	if err != nil {
+		return nil, err
+	}
+	return &App{
+		cfg:    cfg,
+		ledger: ledger,
+		data: []SensingData{
+			{ObjectID: "vehicle-101", X: 10.4, Y: 20.7, Type: "vehicle"},
+			{ObjectID: "vehicle-102", X: 12.1, Y: 22.2, Type: "vehicle"},
+			{ObjectID: "person-201", X: 11.6, Y: 21.4, Type: "person"},
+			{ObjectID: "person-202", X: 30.2, Y: 35.8, Type: "person"},
+			{ObjectID: "vehicle-103", X: 31.5, Y: 36.1, Type: "vehicle"},
+		},
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		client: &http.Client{Timeout: 2 * time.Second},
+	}, nil
+}
+
+func (a *App) Close() error {
+	if a.ledger == nil {
+		return nil
+	}
+	return a.ledger.Close()
+}
+
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use GET"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/readyz", a.readinessHandler)
+	mux.HandleFunc("/sensing", a.sensingHandler)
+	mux.HandleFunc("/budget", a.budgetHandler)
+	return securityHeaders(mux)
+}
+
+func (a *App) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use GET"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+	if err := a.ledger.Ping(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database unavailable"})
+		return
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.OPAURL, "/")+"/health", nil)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy service unavailable"})
+		return
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy service unavailable"})
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy service unavailable"})
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) sensingHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use GET"})
+		return
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GET requests must not include a body"})
+		return
+	}
+	consumer := strings.TrimSpace(r.Header.Get("X-Consumer-ID"))
+	purpose := strings.TrimSpace(r.URL.Query().Get("purpose"))
+	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	if consumer == "" || purpose == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Consumer-ID header and purpose query parameter are required"})
+		return
+	}
+	if len(consumer) > 128 || len(purpose) > 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "consumer ID must be at most 128 bytes and purpose at most 64 bytes"})
+		return
+	}
+	if mode == "" {
+		mode = "coarse"
+	}
+	if mode != "coarse" && mode != "noisy" && mode != "aggregate" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be coarse, noisy, or aggregate"})
+		return
+	}
+	allowed, err := a.authorize(consumer, purpose, mode)
+	if err != nil {
+		log.Printf("event=authorization_error consumer=%q purpose=%q", consumer, purpose)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy service unavailable"})
+		return
+	}
+	if !allowed {
+		log.Printf("event=access_denied consumer=%q purpose=%q mode=%q", consumer, purpose, mode)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "request denied by privacy policy"})
+		return
+	}
+	out := make([]SensingData, 0, len(a.data))
+	for _, d := range a.data {
+		switch mode {
+		case "coarse":
+			d.X = math.Round(d.X/a.cfg.GridSize) * a.cfg.GridSize
+			d.Y = math.Round(d.Y/a.cfg.GridSize) * a.cfg.GridSize
+			d.ObjectID = "object-redacted"
+		case "noisy":
+			d.X += a.laplace(a.cfg.NoiseScale)
+			d.Y += a.laplace(a.cfg.NoiseScale)
+			d.ObjectID = "object-redacted"
+		case "aggregate":
+			// Aggregate output is handled below; do not return individual records.
+		}
+		if mode != "aggregate" {
+			out = append(out, d)
+		}
+	}
+	if mode == "aggregate" {
+		counts := map[string]int{}
+		for _, d := range a.data {
+			counts[d.Type]++
+		}
+		remaining, ok, full, err := a.ledger.Charge(consumer, a.cfg.RequestCost)
+		if err != nil {
+			budgetUnavailable(w, consumer)
+			return
+		}
+		if full {
+			ledgerFull(w)
+			return
+		}
+		if !ok {
+			budgetDenied(w, consumer, purpose, remaining)
+			return
+		}
+		log.Printf("event=access_allowed consumer=%q purpose=%q mode=%q budget_remaining=%.2f", consumer, purpose, mode, remaining)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mode": "aggregate", "counts": counts,
+			"privacy":          "counts only; no object IDs or coordinates",
+			"budget_remaining": remaining,
+		})
+		return
+	}
+	remaining, ok, full, err := a.ledger.Charge(consumer, a.cfg.RequestCost)
+	if err != nil {
+		budgetUnavailable(w, consumer)
+		return
+	}
+	if full {
+		ledgerFull(w)
+		return
+	}
+	if !ok {
+		budgetDenied(w, consumer, purpose, remaining)
+		return
+	}
+	log.Printf("event=access_allowed consumer=%q purpose=%q mode=%q budget_remaining=%.2f", consumer, purpose, mode, remaining)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode": mode, "data": out, "budget_remaining": remaining,
+		"notice": "simulated data; demo privacy controls, not a certified differential-privacy guarantee",
+	})
+}
+
+func budgetDenied(w http.ResponseWriter, consumer, purpose string, remaining float64) {
+	log.Printf("event=budget_denied consumer=%q purpose=%q", consumer, purpose)
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "privacy budget exhausted", "remaining_budget": remaining})
+}
+
+func budgetUnavailable(w http.ResponseWriter, consumer string) {
+	log.Printf("event=budget_store_error consumer=%q", consumer)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "privacy budget service unavailable"})
+}
+
+func ledgerFull(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "privacy budget ledger is at capacity"})
+}
+
+func (a *App) budgetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use GET"})
+		return
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GET requests must not include a body"})
+		return
+	}
+	consumer := strings.TrimSpace(r.Header.Get("X-Consumer-ID"))
+	if consumer == "" || len(consumer) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Consumer-ID header is required and must be at most 128 bytes"})
+		return
+	}
+	remaining, full, err := a.ledger.Snapshot(consumer)
+	if err != nil {
+		budgetUnavailable(w, consumer)
+		return
+	}
+	if full {
+		ledgerFull(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"consumer":         consumer,
+		"remaining_budget": remaining,
+		"note":             "stored in the configured SQLite database",
+	})
+}
+
+func (a *App) authorize(consumer, purpose, mode string) (bool, error) {
+	payload := map[string]any{"input": map[string]any{
+		"consumer": consumer, "purpose": purpose, "mode": mode,
+	}}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(a.cfg.OPAURL, "/")+"/v1/data/senseguard/allow", bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("OPA returned %s", resp.Status)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return false, err
+	}
+	if len(responseBody) > 1<<20 {
+		return false, errors.New("OPA response exceeds 1 MiB")
+	}
+	var result struct {
+		Result *bool `json:"result"`
+	}
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return false, err
+	}
+	if result.Result == nil {
+		return false, errors.New("OPA response is missing result")
+	}
+	return *result.Result, nil
+}
+
+func (a *App) laplace(scale float64) float64 {
+	if !finitePositive(scale) || scale > 1e6 {
+		return 0
+	}
+	a.rngMu.Lock()
+	u := a.rng.Float64() - 0.5
+	a.rngMu.Unlock()
+	if u == 0 {
+		return 0
+	}
+	// Float64 can return zero, which maps to an endpoint and an infinite log.
+	if math.Abs(u) >= 0.5 {
+		u = math.Copysign(math.Nextafter(0.5, 0), u)
+	}
+	return -scale * math.Copysign(1, u) * math.Log(1-2*math.Abs(u))
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func checkReadiness(client *http.Client, url string) error {
+	response, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("readiness endpoint returned %s", response.Status)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return nil
+}
+
+func envFloat(name string, fallback float64) float64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || !finitePositive(n) {
+		log.Printf("invalid %s; using default", name)
+		return fallback
+	}
+	return n
+}
+
+func finitePositive(n float64) bool { return n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
+
+func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		client := &http.Client{Timeout: 2 * time.Second}
+		if err := checkReadiness(client, "http://127.0.0.1:8080/readyz"); err != nil {
+			log.Printf("health check failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	cfg := Config{
+		OPAURL:        os.Getenv("OPA_URL"),
+		DatabasePath:  os.Getenv("DATABASE_PATH"),
+		DefaultBudget: envFloat("DEFAULT_PRIVACY_BUDGET", 5),
+		RequestCost:   envFloat("REQUEST_PRIVACY_COST", 1),
+		GridSize:      envFloat("COARSE_GRID_SIZE", 10),
+		NoiseScale:    envFloat("NOISE_SCALE", 3),
+	}
+	if cfg.OPAURL == "" {
+		cfg.OPAURL = "http://localhost:8181"
+	}
+	app, err := NewApp(cfg)
+	if err != nil {
+		log.Printf("SenseGuard startup failed: %v", err)
+		os.Exit(1)
+	}
+	addr := ":8080"
+	log.Printf("SenseGuard listening on %s; OPA=%s", addr, cfg.OPAURL)
+	server := &http.Server{Addr: addr, Handler: app.routes(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, WriteTimeout: 10 * time.Second, MaxHeaderBytes: 16 << 10}
+	stop, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-stop.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+	}()
+	serveErr := server.ListenAndServe()
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		<-shutdownDone
+	} else if serveErr != nil {
+		log.Printf("HTTP server failed: %v", serveErr)
+	}
+	if err := app.Close(); err != nil {
+		log.Printf("close budget database: %v", err)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		os.Exit(1)
+	}
+}
