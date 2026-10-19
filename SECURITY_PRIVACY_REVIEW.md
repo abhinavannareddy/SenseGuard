@@ -16,7 +16,7 @@ Date: 2026-10-19. This is a source/configuration review, not a penetration test.
 - The `backup` command uses SQLite `VACUUM INTO`, refuses to overwrite an existing path, and verifies snapshot integrity and ledger schema. A separate restore test checks the expected balance. This does not configure automated or off-site backups.
 - Containers run non-root with read-only root filesystems, dropped capabilities, no-new-privileges, seccomp, and resource limits. SQLite is a single-replica ledger.
 - Coarse mode rounds coordinates and redacts IDs; aggregate mode returns counts. Noisy mode uses cryptographic randomness for demo noise but does not provide formal differential privacy.
-- A GitHub Actions verification workflow runs tests, OPA checks, image build, Compose validation, and Kubernetes schema validation with `contents: read`; it does not deploy or publish images. The workflow was linted locally but its first GitHub-hosted run is pending.
+- A GitHub Actions verification workflow runs tests, OPA checks, image build, Compose validation, and Kubernetes schema validation with `contents: read`; it does not deploy or publish images. The first hosted run passed; action references and the runner were then pinned to avoid Node 20 and `ubuntu-latest` migration warnings, and the updated workflow run remains to be confirmed.
 
 ## Verification on the current working tree
 

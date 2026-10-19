@@ -20,7 +20,8 @@ This checklist records repository verification only. No staging, production, clo
 - [x] Go tests created a SQLite snapshot, verified integrity, refused to overwrite an existing destination, and restored a separate copy with the expected balance.
 - [x] Backup CLI rejects a non-SenseGuard database without changing its contents.
 - [x] The Go mTLS integration test passed with ephemeral local certificates; deployment certificates and target trust configuration are not covered by this test.
-- [ ] GitHub-hosted Actions run for this working tree is pending; the workflow has not been pushed or executed by GitHub yet.
+- [x] The first GitHub-hosted Actions run passed for commit `8e65fe5`.
+- [ ] Confirm the run passes after pinning the workflow actions by SHA and the runner to Ubuntu 24.04.
 - [ ] Target-issued certificates, trust chains, renewal, DNS SANs, and target-cluster TLS/mTLS behavior remain unverified.
 - [ ] Target Kubernetes version, cluster CNI, certificates, credentials, registry image, PVC behavior, and operational recovery objectives remain unverified.
 
