@@ -5,7 +5,6 @@ import rego.v1
 test_researcher_can_use_crowd_analysis_modes if {
 	allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "coarse"}
 }
-
 test_researcher_can_use_noisy_mode if {
 	allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "noisy"}
 }

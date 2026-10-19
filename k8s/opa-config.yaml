@@ -18,3 +18,8 @@ data:
       input.purpose == "occupancy-monitoring"
       input.mode == "aggregate"
     }
+    healthcheck if {
+      response := http.send({"url": "http://127.0.0.1:8282/health", "method": "get", "timeout": "1s"})
+      response.status_code == 200
+      allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "coarse"}
+    }

@@ -22,7 +22,8 @@ spec:
           image: senseguard:local
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8080
+            - name: https
+              containerPort: 8080
           resources:
             requests:
               cpu: 50m
@@ -32,7 +33,24 @@ spec:
               memory: 256Mi
           env:
             - name: OPA_URL
-              value: http://opa:8181
+              value: https://opa:8181
+            - name: OPA_CA_FILE
+              value: /opa-client/ca.crt
+            - name: OPA_CLIENT_CERT_FILE
+              value: /opa-client/tls.crt
+            - name: OPA_CLIENT_KEY_FILE
+              value: /opa-client/tls.key
+            - name: REQUIRE_TLS
+              value: "true"
+            - name: TLS_CERT_FILE
+              value: /tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /tls/tls.key
+            - name: CONSUMER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: senseguard-consumer-credentials
+                  key: tokens
             - name: DEFAULT_PRIVACY_BUDGET
               value: "5"
             - name: REQUEST_PRIVACY_COST
@@ -46,16 +64,24 @@ spec:
           volumeMounts:
             - name: senseguard-data
               mountPath: /data
+            - name: senseguard-tls
+              mountPath: /tls
+              readOnly: true
+            - name: opa-client-tls
+              mountPath: /opa-client
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8080
+              scheme: HTTPS
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
           securityContext:
@@ -71,6 +97,21 @@ spec:
         - name: senseguard-data
           persistentVolumeClaim:
             claimName: senseguard-data
+        - name: senseguard-tls
+          secret:
+            secretName: senseguard-tls
+            defaultMode: 0440
+        - name: opa-client-tls
+          secret:
+            secretName: senseguard-to-opa-client
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+              - key: ca.crt
+                path: ca.crt
 ---
 apiVersion: v1
 kind: Service
@@ -81,6 +122,7 @@ spec:
   selector:
     app: senseguard
   ports:
-    - port: 8080
+    - name: https
+      port: 443
       targetPort: 8080
   type: ClusterIP

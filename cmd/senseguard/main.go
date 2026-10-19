@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +15,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,21 +34,29 @@ type SensingData struct {
 }
 
 type Config struct {
-	DatabasePath  string
-	OPAURL        string
-	DefaultBudget float64
-	RequestCost   float64
-	GridSize      float64
-	NoiseScale    float64
+	DatabasePath      string
+	OPAURL            string
+	DefaultBudget     float64
+	RequestCost       float64
+	GridSize          float64
+	NoiseScale        float64
+	ConsumerTokens    map[string]string
+	TLSCertFile       string
+	TLSKeyFile        string
+	RequireTLS        bool
+	OPACertFile       string
+	OPAClientCertFile string
+	OPAClientKeyFile  string
 }
 
 type App struct {
-	cfg    Config
-	ledger *BudgetLedger
-	data   []SensingData
-	rng    *rand.Rand
-	rngMu  sync.Mutex
-	client *http.Client
+	cfg                 Config
+	ledger              *BudgetLedger
+	data                []SensingData
+	rng                 *rand.Rand
+	rngMu               sync.Mutex
+	client              *http.Client
+	consumerTokenHashes map[[32]byte]string
 }
 
 func NewApp(cfg Config) (*App, error) {
@@ -66,6 +79,51 @@ func NewApp(cfg Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	tokenHashes := make(map[[32]byte]string, len(cfg.ConsumerTokens))
+	for consumer, token := range cfg.ConsumerTokens {
+		if !validConsumerID(consumer) || len(token) < 32 || strings.TrimSpace(token) != token {
+			_ = ledger.Close()
+			return nil, errors.New("consumer credentials are invalid")
+		}
+		hash := sha256.Sum256([]byte(token))
+		if _, exists := tokenHashes[hash]; exists {
+			_ = ledger.Close()
+			return nil, errors.New("consumer credentials must be unique")
+		}
+		tokenHashes[hash] = consumer
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	if cfg.OPACertFile != "" || cfg.OPAClientCertFile != "" || cfg.OPAClientKeyFile != "" {
+		if (cfg.OPAClientCertFile == "") != (cfg.OPAClientKeyFile == "") {
+			_ = ledger.Close()
+			return nil, errors.New("OPA client certificate and key must both be configured")
+		}
+		caPEM, err := os.ReadFile(cfg.OPACertFile)
+		if err != nil {
+			_ = ledger.Close()
+			return nil, errors.New("could not load OPA CA certificate")
+		}
+		// Trust only the configured CA for OPA. Adding system roots would let
+		// any generally trusted public CA issue a certificate for this endpoint.
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caPEM) {
+			_ = ledger.Close()
+			return nil, errors.New("OPA CA file contains no valid certificates")
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+		if cfg.OPAClientCertFile != "" {
+			clientCert, err := tls.LoadX509KeyPair(cfg.OPAClientCertFile, cfg.OPAClientKeyFile)
+			if err != nil {
+				_ = ledger.Close()
+				return nil, errors.New("could not load OPA client certificate")
+			}
+			tlsConfig.Certificates = []tls.Certificate{clientCert}
+		}
+		transport.TLSClientConfig = tlsConfig
+		client.Transport = transport
+	}
+	cfg.ConsumerTokens = nil
 	return &App{
 		cfg:    cfg,
 		ledger: ledger,
@@ -76,8 +134,9 @@ func NewApp(cfg Config) (*App, error) {
 			{ObjectID: "person-202", X: 30.2, Y: 35.8, Type: "person"},
 			{ObjectID: "vehicle-103", X: 31.5, Y: 36.1, Type: "vehicle"},
 		},
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
-		client: &http.Client{Timeout: 2 * time.Second},
+		rng:                 rand.New(rand.NewSource(time.Now().UnixNano())),
+		client:              client,
+		consumerTokenHashes: tokenHashes,
 	}, nil
 }
 
@@ -99,9 +158,105 @@ func (a *App) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/readyz", a.readinessHandler)
-	mux.HandleFunc("/sensing", a.sensingHandler)
-	mux.HandleFunc("/budget", a.budgetHandler)
+	mux.Handle("/sensing", a.authenticated(http.HandlerFunc(a.sensingHandler)))
+	mux.Handle("/budget", a.authenticated(http.HandlerFunc(a.budgetHandler)))
 	return securityHeaders(mux)
+}
+
+type consumerContextKey struct{}
+
+func (a *App) authenticated(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		header := r.Header.Get("Authorization")
+		authorizationValues := r.Header.Values("Authorization")
+		if len(authorizationValues) != 1 || !strings.HasPrefix(header, prefix) || len(header) <= len(prefix) || strings.ContainsAny(header[len(prefix):], " \t\r\n") {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		hash := sha256.Sum256([]byte(header[len(prefix):]))
+		consumer := ""
+		for expectedHash, identity := range a.consumerTokenHashes {
+			if subtle.ConstantTimeCompare(hash[:], expectedHash[:]) == 1 {
+				consumer = identity
+			}
+		}
+		if consumer == "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		claimed := strings.TrimSpace(r.Header.Get("X-Consumer-ID"))
+		if claimed != "" && claimed != consumer {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "consumer identity does not match credentials"})
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), consumerContextKey{}, consumer)))
+	})
+}
+
+func authenticatedConsumer(r *http.Request) string {
+	consumer, _ := r.Context().Value(consumerContextKey{}).(string)
+	return consumer
+}
+
+func validConsumerID(consumer string) bool {
+	return consumer != "" && len(consumer) <= 128 && strings.TrimSpace(consumer) == consumer
+}
+
+func validateTLSConfig(certFile, keyFile string, required bool) error {
+	if (certFile == "") != (keyFile == "") || (required && certFile == "") {
+		return errors.New("TLS certificate and key must both be configured")
+	}
+	return nil
+}
+
+func parseRequireTLS(raw string) (bool, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.EqualFold(value, "false") {
+		return false, nil
+	}
+	if strings.EqualFold(value, "true") {
+		return true, nil
+	}
+	return false, errors.New("REQUIRE_TLS must be true or false")
+}
+
+func validateOPAURL(raw string, requireTLS bool) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("OPA_URL must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("OPA_URL must use HTTP or HTTPS")
+	}
+	if requireTLS && parsed.Scheme != "https" {
+		return errors.New("OPA_URL must use HTTPS when REQUIRE_TLS is true")
+	}
+	return nil
+}
+
+func parseConsumerTokens(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("CONSUMER_TOKENS is required")
+	}
+	var tokens map[string]string
+	if err := json.Unmarshal([]byte(raw), &tokens); err != nil || len(tokens) == 0 {
+		return nil, errors.New("CONSUMER_TOKENS must be a non-empty JSON object")
+	}
+	seen := make(map[[32]byte]struct{}, len(tokens))
+	for consumer, token := range tokens {
+		if !validConsumerID(consumer) || len(token) < 32 || strings.TrimSpace(token) != token {
+			return nil, errors.New("CONSUMER_TOKENS contains an invalid identity or token")
+		}
+		hash := sha256.Sum256([]byte(token))
+		if _, ok := seen[hash]; ok {
+			return nil, errors.New("CONSUMER_TOKENS must use unique tokens")
+		}
+		seen[hash] = struct{}{}
+	}
+	return tokens, nil
 }
 
 func (a *App) readinessHandler(w http.ResponseWriter, r *http.Request) {
@@ -153,15 +308,15 @@ func (a *App) sensingHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GET requests must not include a body"})
 		return
 	}
-	consumer := strings.TrimSpace(r.Header.Get("X-Consumer-ID"))
+	consumer := authenticatedConsumer(r)
 	purpose := strings.TrimSpace(r.URL.Query().Get("purpose"))
 	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
 	if consumer == "" || purpose == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Consumer-ID header and purpose query parameter are required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "authenticated consumer and purpose query parameter are required"})
 		return
 	}
-	if len(consumer) > 128 || len(purpose) > 64 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "consumer ID must be at most 128 bytes and purpose at most 64 bytes"})
+	if len(purpose) > 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "purpose must be at most 64 bytes"})
 		return
 	}
 	if mode == "" {
@@ -270,9 +425,9 @@ func (a *App) budgetHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GET requests must not include a body"})
 		return
 	}
-	consumer := strings.TrimSpace(r.Header.Get("X-Consumer-ID"))
-	if consumer == "" || len(consumer) > 128 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "X-Consumer-ID header is required and must be at most 128 bytes"})
+	consumer := authenticatedConsumer(r)
+	if consumer == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		return
 	}
 	remaining, full, err := a.ledger.Snapshot(consumer)
@@ -391,25 +546,61 @@ func main() {
 		}
 		return
 	}
+	tokens, err := parseConsumerTokens(os.Getenv("CONSUMER_TOKENS"))
+	if err != nil {
+		log.Printf("SenseGuard startup failed: %v", err)
+		os.Exit(1)
+	}
+	requireTLS, err := parseRequireTLS(os.Getenv("REQUIRE_TLS"))
+	if err != nil {
+		log.Printf("SenseGuard startup failed: %v", err)
+		os.Exit(1)
+	}
 	cfg := Config{
-		OPAURL:        os.Getenv("OPA_URL"),
-		DatabasePath:  os.Getenv("DATABASE_PATH"),
-		DefaultBudget: envFloat("DEFAULT_PRIVACY_BUDGET", 5),
-		RequestCost:   envFloat("REQUEST_PRIVACY_COST", 1),
-		GridSize:      envFloat("COARSE_GRID_SIZE", 10),
-		NoiseScale:    envFloat("NOISE_SCALE", 3),
+		OPAURL:            os.Getenv("OPA_URL"),
+		DatabasePath:      os.Getenv("DATABASE_PATH"),
+		DefaultBudget:     envFloat("DEFAULT_PRIVACY_BUDGET", 5),
+		RequestCost:       envFloat("REQUEST_PRIVACY_COST", 1),
+		GridSize:          envFloat("COARSE_GRID_SIZE", 10),
+		NoiseScale:        envFloat("NOISE_SCALE", 3),
+		ConsumerTokens:    tokens,
+		TLSCertFile:       os.Getenv("TLS_CERT_FILE"),
+		TLSKeyFile:        os.Getenv("TLS_KEY_FILE"),
+		RequireTLS:        requireTLS,
+		OPACertFile:       os.Getenv("OPA_CA_FILE"),
+		OPAClientCertFile: os.Getenv("OPA_CLIENT_CERT_FILE"),
+		OPAClientKeyFile:  os.Getenv("OPA_CLIENT_KEY_FILE"),
 	}
 	if cfg.OPAURL == "" {
 		cfg.OPAURL = "http://localhost:8181"
 	}
+	if err := validateOPAURL(cfg.OPAURL, requireTLS); err != nil {
+		log.Printf("SenseGuard startup failed: %v", err)
+		os.Exit(1)
+	}
+	if requireTLS && cfg.OPACertFile == "" {
+		log.Printf("SenseGuard startup failed: OPA_CA_FILE is required when REQUIRE_TLS is true")
+		os.Exit(1)
+	}
+	if requireTLS && ((cfg.OPAClientCertFile == "") != (cfg.OPAClientKeyFile == "") || cfg.OPAClientCertFile == "") {
+		log.Printf("SenseGuard startup failed: OPA client certificate and key are required when REQUIRE_TLS is true")
+		os.Exit(1)
+	}
+	if err := validateTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.RequireTLS); err != nil {
+		log.Printf("SenseGuard startup failed: %v", err)
+		os.Exit(1)
+	}
 	app, err := NewApp(cfg)
+	for consumer := range tokens {
+		delete(tokens, consumer)
+	}
 	if err != nil {
 		log.Printf("SenseGuard startup failed: %v", err)
 		os.Exit(1)
 	}
 	addr := ":8080"
-	log.Printf("SenseGuard listening on %s; OPA=%s", addr, cfg.OPAURL)
-	server := &http.Server{Addr: addr, Handler: app.routes(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, WriteTimeout: 10 * time.Second, MaxHeaderBytes: 16 << 10}
+	log.Printf("SenseGuard listening on %s; TLS=%t", addr, cfg.TLSCertFile != "")
+	server := &http.Server{Addr: addr, Handler: app.routes(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, WriteTimeout: 10 * time.Second, MaxHeaderBytes: 16 << 10, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	stop, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 	shutdownDone := make(chan struct{})
@@ -422,7 +613,12 @@ func main() {
 			log.Printf("graceful shutdown failed: %v", err)
 		}
 	}()
-	serveErr := server.ListenAndServe()
+	var serveErr error
+	if cfg.TLSCertFile != "" {
+		serveErr = server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+	} else {
+		serveErr = server.ListenAndServe()
+	}
 	if errors.Is(serveErr, http.ErrServerClosed) {
 		<-shutdownDone
 	} else if serveErr != nil {

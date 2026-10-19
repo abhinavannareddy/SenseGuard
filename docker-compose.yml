@@ -1,7 +1,7 @@
 services:
   opa:
     image: openpolicyagent/opa:1.0.0
-    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/senseguard.rego"]
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--diagnostic-addr=127.0.0.1:8282", "/policy/senseguard.rego"]
     volumes:
       - ./policy:/policy:ro
     ports:
@@ -10,7 +10,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "/opa", "eval", "--format", "raw", "true"]
+      test: ["CMD", "/opa", "eval", "--fail", "--format", "raw", "--data=/policy/senseguard.rego", "data.senseguard.healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -26,6 +26,7 @@ services:
       COARSE_GRID_SIZE: "10"
       NOISE_SCALE: "3"
       DATABASE_PATH: /data/senseguard.db
+      CONSUMER_TOKENS: ${CONSUMER_TOKENS:?Set_CONSUMER_TOKENS_to_a_JSON_object_of_consumer_tokens}
     volumes:
       - senseguard-data:/data
     ports:

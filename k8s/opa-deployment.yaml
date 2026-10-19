@@ -13,10 +13,14 @@ spec:
       labels:
         app: opa
     spec:
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: opa
           image: openpolicyagent/opa:1.0.0
-          args: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/senseguard.rego"]
+          args: ["run", "--server", "--addr=https://0.0.0.0:8181", "--diagnostic-addr=127.0.0.1:8282", "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key", "--tls-ca-cert-file=/tls/ca.crt", "--authentication=tls", "/policy/senseguard.rego"]
           ports:
             - containerPort: 8181
           resources:
@@ -27,19 +31,27 @@ spec:
               cpu: 500m
               memory: 512Mi
           readinessProbe:
-            httpGet:
-              path: /health
-              port: 8181
-              scheme: HTTP
+            exec:
+              command:
+                - /opa
+                - eval
+                - --fail
+                - --format=raw
+                - --data=/policy/senseguard.rego
+                - data.senseguard.healthcheck
             initialDelaySeconds: 2
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 8181
-              scheme: HTTP
+            exec:
+              command:
+                - /opa
+                - eval
+                - --fail
+                - --format=raw
+                - --data=/policy/senseguard.rego
+                - data.senseguard.healthcheck
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 2
@@ -47,6 +59,9 @@ spec:
           volumeMounts:
             - name: policy
               mountPath: /policy
+              readOnly: true
+            - name: opa-tls
+              mountPath: /tls
               readOnly: true
           securityContext:
             runAsNonRoot: true
@@ -63,6 +78,17 @@ spec:
         - name: policy
           configMap:
             name: senseguard-policy
+        - name: opa-tls
+          secret:
+            secretName: opa-server-tls
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+              - key: ca.crt
+                path: ca.crt
 ---
 apiVersion: v1
 kind: Service
@@ -73,5 +99,26 @@ spec:
   selector:
     app: opa
   ports:
-    - port: 8181
+    - name: https
+      port: 8181
       targetPort: 8181
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opa-from-senseguard-only
+  namespace: senseguard
+spec:
+  podSelector:
+    matchLabels:
+      app: opa
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: senseguard
+      ports:
+        - protocol: TCP
+          port: 8181

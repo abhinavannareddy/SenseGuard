@@ -6,6 +6,9 @@ coverage.out
 
 # Secrets and local data
 .env
+consumer-tokens.json
+*.key
+*.crt
 data/
 *.db
 *.db-shm

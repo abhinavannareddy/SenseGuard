@@ -1,38 +1,45 @@
 # Security and privacy review
 
-Date: 2026-10-17. This is a source/configuration review, not a penetration test. Use simulated data only.
+Date: 2026-10-19. This is a source/configuration review, not a penetration test. Use simulated data only.
 
-## Confirmed controls
+## Implemented controls
 
+- `/sensing` and `/budget` require bearer credentials. Identity is derived from the matching secret token, not `X-Consumer-ID`. Mismatched caller claims are rejected. Tokens must be unique and at least 32 characters, are hashed in memory for lookup, and are not logged. Production credentials are supplied from an external secret configuration; none are committed.
+- `REQUIRE_TLS` rejects malformed values instead of treating typos as disabled TLS. Duplicate Authorization headers are rejected. The OPA TLS client trusts only the CA configured for OPA.
+- Kubernetes requires API HTTPS and HTTPS with mutual TLS to OPA. The API verifies OPA's server certificate against a configured CA. OPA requires a client certificate. TLS 1.2 or newer is configured for both endpoints.
+- Kubernetes OPA ingress is restricted to SenseGuard pods by a NetworkPolicy. This depends on a CNI that enforces NetworkPolicy. The app Service is ClusterIP-only; no Ingress is defined.
+- Compose ports bind to localhost. Its OPA health check evaluates a known allowed policy decision and calls the OPA `/health` endpoint; SenseGuard readiness checks SQLite and OPA health.
 - OPA authorization runs before budget charging. OPA transport failures, timeouts, non-200 responses, malformed JSON, and missing decisions fail closed.
 - SQLite statements are parameterized. Budget updates are transactional, validate finite positive costs, and return data only after a confirmed commit.
-- The app container is non-root, read-only-root, and configured with `no-new-privileges`; its writable database directory is a named volume. Published Compose ports bind to loopback.
-- `/readyz` checks the database and OPA HTTP `/health`. `/healthz` is a liveness response.
-- The SQLite ledger is designed for one SenseGuard replica. POSIX file permissions are restricted where supported; Windows ACL and Kubernetes storage behavior are environment-dependent.
+- Containers use non-root identities, read-only root filesystems, dropped capabilities, seccomp, resource requests/limits, and no-new-privileges in Compose. The SQLite ledger is designed for a single SenseGuard replica.
 - Coarse mode rounds coordinates and redacts IDs. Aggregate mode returns counts. Noisy mode adds pseudo-random Laplace-shaped noise.
 
-Previously recorded tests include Go tests, race tests, vet, coverage (72.3%), OPA policy tests (11/11), Compose validation, container build and local runtime checks. Those historical results are described in `VERIFICATION_REPORT.md`; they were not rerun in this session because Go and OPA are unavailable and Docker Engine access was denied.
+Historical test and runtime results refer to an earlier revision. The authentication, TLS, and manifest changes in the current work have not yet passed Go or OPA tests because those tools are unavailable; Docker Engine access is unavailable in this session.
 
-## Critical findings and limits
+## Remaining risks and deployment limits
 
-- **Authentication is absent.** `/sensing` and `/budget` derive the consumer from caller-controlled `X-Consumer-ID`. Anyone able to reach the service can impersonate a consumer, spend their budget, and retrieve their balance. OPA's allow-list is not identity verification. There is no credential issuer or established secret configuration in this prototype, so this issue is unresolved. Do not expose the service beyond a controlled local environment.
-- **Transport security is absent.** The API and OPA use HTTP. Compose loopback binding limits host exposure but does not provide TLS or protect traffic through a proxy/host compromise. Production needs verified identity, TLS, and appropriate network controls, including pod-to-pod OPA traffic.
-- **OPA health check is weak.** Compose's current OPA health check evaluates the constant `true`; it can report healthy without checking the listener or policy. SenseGuard readiness checks database and OPA `/health`, but this health endpoint does not prove the intended policy is loaded. OPA unavailability during authorization fails closed.
-- **No formal differential privacy.** The budget is a per-request counter, not epsilon accounting. Noise has no defined sensitivity, neighboring-data model, or accountant. Coarse output retains types/counts, and small aggregates can expose individuals. No formal differential privacy claim is supported.
-- **Backup/recovery is unverified.** The app-stopped file-copy instructions are not a tested recovery procedure. The persistent volume is not a backup.
-- **Kubernetes is unverified.** No cluster deployment or reliable offline schema validation was completed in this session. StorageClass, volume permissions, `fsGroup`, image availability, and persistence require target validation. The deployment is single replica.
-- SQLite is not application-encrypted. Logs can include consumer IDs and purposes.
+- Bearer credentials are static until rotated. Their secure issuance, distribution, revocation, and storage are operational responsibilities. Kubernetes Secrets need encryption at rest and least-privilege RBAC. No identity provider or token refresh is integrated.
+- The Kubernetes app Service is ClusterIP-only. There is no external Ingress, DNS, certificate issuance, or firewall configuration. Any external access requires a separately reviewed TLS-preserving/reencrypting gateway and network policy.
+- OPA's TLS client authentication trusts any client certificate issued by the configured CA. Restrict issuance of that client certificate to SenseGuard and protect CA keys. NetworkPolicy enforcement depends on the target CNI.
+- Compose remains HTTP development only and must stay on a trusted local machine. Do not use it for untrusted callers.
+- No formal differential privacy. The budget is a per-request counter, not epsilon accounting. Noise has no defined sensitivity, neighboring-data model, or accountant. Coarse output retains types/counts, and small aggregates can expose individuals.
+- Backup/recovery is not validated. The persistent volume is not a backup. SQLite is not application-encrypted.
+- Kubernetes schema validation and target-cluster behavior are not verified. StorageClass, volume permissions, `fsGroup`, Secret encryption, CNI policy enforcement, image availability, and persistence require target validation. Keep one app replica.
+- Logs can include authenticated consumer IDs and purposes. Resource values have not been load-tested.
 
-## Required before staging with untrusted callers or production
+## Required before any staging rollout
 
-1. Implement verified consumer authentication and bind both sensing and budget lookup to the authenticated principal; test unauthenticated and impersonation attempts.
-2. Configure TLS at a reviewed endpoint and protect internal service traffic; restrict network access.
-3. Improve the OPA health check and verify startup/readiness behavior with the selected OPA image.
-4. Define and review formal privacy/accounting semantics before making privacy guarantees.
-5. Test a backup and restore into a separate database location; establish retention and recovery objectives.
-6. Validate Kubernetes manifests offline and validate storage, permissions, images, and persistence in the target environment.
-7. Complete threat modeling, monitoring/log review, and independent security/privacy review.
+1. Run Go tests, race tests, vet, OPA tests, Compose validation, and Docker build against the changed code.
+2. Validate Kubernetes manifests with an offline schema validator and verify the target CNI enforces NetworkPolicy.
+3. Provide real trusted API, OPA server, OPA client, and CA certificates using external secret management; verify their names, trust chain, expiry, and rotation.
+4. Provision consumer bearer tokens through an identity owner, configure Secret encryption/RBAC, and test authentication, impersonation, revocation, and rotation.
+5. Test SQLite backup/restore to a separate database and document recovery objectives.
+6. Perform a restricted runtime staging validation, including readiness, authorization, OPA failure, budget exhaustion, and TLS verification.
+
+## Required before production
+
+Define a reviewed privacy model/accountant before making formal privacy claims; complete threat modeling, monitoring and retention/log safeguards, measured capacity planning, target-cluster storage validation, and independent security/privacy review. Establish a supported shared budget design before scaling beyond one app replica.
 
 ## Verdict
 
-**NOT READY FOR STAGING WITH UNTRUSTED CALLERS OR PRODUCTION DEPLOYMENT.** Local restricted development only. No authentication, TLS, formal privacy model, or validated recovery process is in place.
+**NOT YET READY FOR STAGING ROLLOUT OR PRODUCTION.** Identity and TLS controls are now implemented in code/configuration, but the changes and target deployment environment still need verification and operational secrets/certificates.

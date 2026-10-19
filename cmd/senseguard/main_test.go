@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -16,6 +17,13 @@ import (
 	"testing"
 	"time"
 )
+
+const testResearcherToken = "test-only-researcher-token-0123456789"
+const testMallToken = "test-only-mall-manager-token-012345678"
+
+func testTokens() map[string]string {
+	return map[string]string{"researcher": testResearcherToken, "mall-manager": testMallToken}
+}
 
 func testApp(t *testing.T) (*App, *httptest.Server) {
 	t.Helper()
@@ -38,12 +46,15 @@ func testApp(t *testing.T) (*App, *httptest.Server) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"result": allow})
 	}))
 	t.Cleanup(opa.Close)
-	app := newTestApplication(t, Config{OPAURL: opa.URL, DefaultBudget: 2, RequestCost: 1, GridSize: 10, NoiseScale: 1})
+	app := newTestApplication(t, Config{OPAURL: opa.URL, DefaultBudget: 2, RequestCost: 1, GridSize: 10, NoiseScale: 1, ConsumerTokens: testTokens()})
 	return app, opa
 }
 
 func newTestApplication(t *testing.T, cfg Config) *App {
 	t.Helper()
+	if cfg.ConsumerTokens == nil {
+		cfg.ConsumerTokens = testTokens()
+	}
 	if cfg.DatabasePath == "" {
 		cfg.DatabasePath = filepath.Join(t.TempDir(), "senseguard.db")
 	}
@@ -76,7 +87,7 @@ func newTestLedger(t *testing.T, initial float64) *BudgetLedger {
 func TestAllowedRequestReturnsProtectedData(t *testing.T) {
 	app, _ := testApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=coarse", nil)
-	req.Header.Set("X-Consumer-ID", "researcher")
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -104,7 +115,7 @@ func TestAllowedRequestReturnsProtectedData(t *testing.T) {
 func TestDeniedRequestDoesNotReturnData(t *testing.T) {
 	app, _ := testApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=track-person&mode=coarse", nil)
-	req.Header.Set("X-Consumer-ID", "unknown")
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -116,7 +127,7 @@ func TestBudgetExhaustion(t *testing.T) {
 	app, _ := testApp(t)
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=aggregate", nil)
-		req.Header.Set("X-Consumer-ID", "researcher")
+		req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 		rec := httptest.NewRecorder()
 		app.routes().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -124,7 +135,7 @@ func TestBudgetExhaustion(t *testing.T) {
 		}
 	}
 	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=aggregate", nil)
-	req.Header.Set("X-Consumer-ID", "researcher")
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
@@ -132,9 +143,136 @@ func TestBudgetExhaustion(t *testing.T) {
 	}
 }
 
-func TestMissingConsumerRejected(t *testing.T) {
+func TestProtectedEndpointsRequireAuthentication(t *testing.T) {
 	app, _ := testApp(t)
-	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis", nil)
+	for _, path := range []string{"/sensing?purpose=crowd-analysis", "/budget"} {
+		rec := httptest.NewRecorder()
+		app.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: want 401 without credentials, got %d", path, rec.Code)
+		}
+	}
+}
+
+func TestConsumerCannotImpersonateAnotherIdentity(t *testing.T) {
+	app, _ := testApp(t)
+	before, _, err := app.ledger.Snapshot("mall-manager")
+	if err != nil || before != 2 {
+		t.Fatalf("initial mall-manager balance: remaining=%v err=%v", before, err)
+	}
+	for _, path := range []string{"/sensing?purpose=occupancy-monitoring&mode=aggregate", "/budget"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+testResearcherToken)
+		req.Header.Set("X-Consumer-ID", "mall-manager")
+		rec := httptest.NewRecorder()
+		app.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s: want 403 for identity mismatch, got %d", path, rec.Code)
+		}
+	}
+	after, _, err := app.ledger.Snapshot("mall-manager")
+	if err != nil || after != before {
+		t.Fatalf("impersonation changed mall-manager balance: before=%v after=%v err=%v", before, after, err)
+	}
+}
+
+func TestConsumerTokensMustBeStrongAndUnique(t *testing.T) {
+	valid := "0123456789abcdef0123456789abcdef"
+	for _, raw := range []string{"", `{}`, `{"researcher":"short"}`, `{"a":"` + valid + `","b":"` + valid + `"}`, `[]`} {
+		if _, err := parseConsumerTokens(raw); err == nil {
+			t.Errorf("accepted invalid token configuration %q", raw)
+		}
+	}
+	if tokens, err := parseConsumerTokens(`{"researcher":"` + valid + `"}`); err != nil || tokens["researcher"] != valid {
+		t.Fatalf("valid token configuration rejected: tokens=%v err=%v", tokens, err)
+	}
+}
+
+func TestTLSConfigurationRequiresCertificatePair(t *testing.T) {
+	for _, tc := range []struct {
+		cert, key string
+		required  bool
+		wantErr   bool
+	}{
+		{"", "", false, false},
+		{"", "", true, true},
+		{"cert", "", false, true},
+		{"", "key", false, true},
+		{"cert", "key", true, false},
+	} {
+		if err := validateTLSConfig(tc.cert, tc.key, tc.required); (err != nil) != tc.wantErr {
+			t.Errorf("validateTLSConfig(%q,%q,%t) error=%v, wantErr=%t", tc.cert, tc.key, tc.required, err, tc.wantErr)
+		}
+	}
+}
+
+func TestRequireTLSConfigurationIsStrict(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+		fail  bool
+	}{
+		{"", false, false},
+		{"false", false, false},
+		{"TRUE", true, false},
+		{"treu", false, true},
+		{"yes", false, true},
+	} {
+		got, err := parseRequireTLS(tc.value)
+		if (err != nil) != tc.fail || got != tc.want {
+			t.Errorf("parseRequireTLS(%q) = (%t, %v), want (%t, fail=%t)", tc.value, got, err, tc.want, tc.fail)
+		}
+	}
+}
+
+func TestOPAURLValidation(t *testing.T) {
+	for _, tc := range []struct {
+		url        string
+		requireTLS bool
+		fail       bool
+	}{
+		{"http://opa:8181", false, false},
+		{"https://opa:8181", true, false},
+		{"http://opa:8181", true, true},
+		{"ftp://opa:8181", false, true},
+		{"https://user:password@opa:8181", false, true},
+		{"/relative", false, true},
+		{"https://opa:8181/path?query=1", false, true},
+	} {
+		err := validateOPAURL(tc.url, tc.requireTLS)
+		if (err != nil) != tc.fail {
+			t.Errorf("validateOPAURL(%q, %t) error=%v, want fail=%t", tc.url, tc.requireTLS, err, tc.fail)
+		}
+	}
+}
+
+func TestDuplicateAuthorizationHeadersAreRejected(t *testing.T) {
+	app, _ := testApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/budget", nil)
+	req.Header.Add("Authorization", "Bearer "+testResearcherToken)
+	req.Header.Add("Authorization", "Bearer "+testResearcherToken)
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401 for duplicate credentials, got %d", rec.Code)
+	}
+}
+
+func TestUnrecognizedBearerTokenIsRejected(t *testing.T) {
+	app, _ := testApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/budget", nil)
+	req.Header.Set("Authorization", "Bearer not-a-valid-token")
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401 for invalid credentials, got %d", rec.Code)
+	}
+}
+
+func TestMissingPurposeRejected(t *testing.T) {
+	app, _ := testApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/sensing", nil)
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -145,7 +283,7 @@ func TestMissingConsumerRejected(t *testing.T) {
 func TestSensingRejectsRequestBodyAndWrongMethod(t *testing.T) {
 	app, _ := testApp(t)
 	withBody := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis", strings.NewReader("unexpected"))
-	withBody.Header.Set("X-Consumer-ID", "researcher")
+	withBody.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, withBody)
 	if rec.Code != http.StatusBadRequest {
@@ -153,7 +291,7 @@ func TestSensingRejectsRequestBodyAndWrongMethod(t *testing.T) {
 	}
 
 	wrongMethod := httptest.NewRequest(http.MethodPost, "/sensing?purpose=crowd-analysis", nil)
-	wrongMethod.Header.Set("X-Consumer-ID", "researcher")
+	wrongMethod.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec = httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, wrongMethod)
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -169,12 +307,11 @@ func TestInvalidRequestsAreRejected(t *testing.T) {
 	for _, tc := range []struct{ name, consumer, query string }{
 		{"missing purpose", "researcher", "/sensing"},
 		{"unsupported mode", "researcher", "/sensing?purpose=crowd-analysis&mode=raw"},
-		{"oversized consumer", strings.Repeat("x", 129), "/sensing?purpose=crowd-analysis"},
 		{"oversized purpose", "researcher", "/sensing?purpose=" + strings.Repeat("x", 65)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.query, nil)
-			req.Header.Set("X-Consumer-ID", tc.consumer)
+			req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 			rec := httptest.NewRecorder()
 			app.routes().ServeHTTP(rec, req)
 			if rec.Code != http.StatusBadRequest {
@@ -242,7 +379,7 @@ func TestLaplaceNoiseRemainsFiniteAtRandomEndpoint(t *testing.T) {
 func TestDeniedAndUnavailableAuthorizationDoNotSpendBudget(t *testing.T) {
 	app, opa := testApp(t)
 	denied := httptest.NewRequest(http.MethodGet, "/sensing?purpose=track-person&mode=coarse", nil)
-	denied.Header.Set("X-Consumer-ID", "researcher")
+	denied.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, denied)
 	if rec.Code != http.StatusForbidden {
@@ -255,7 +392,7 @@ func TestDeniedAndUnavailableAuthorizationDoNotSpendBudget(t *testing.T) {
 	opa.Close()
 	app.cfg.OPAURL = opa.URL
 	unavailable := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=coarse", nil)
-	unavailable.Header.Set("X-Consumer-ID", "researcher")
+	unavailable.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec = httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, unavailable)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -289,7 +426,7 @@ func TestConcurrentRequestsCannotOverspend(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=aggregate", nil)
-			req.Header.Set("X-Consumer-ID", "researcher")
+			req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 			rec := httptest.NewRecorder()
 			app.routes().ServeHTTP(rec, req)
 			if rec.Code == http.StatusOK {
@@ -313,7 +450,7 @@ func TestPrivacyModesDoNotReturnRawIDs(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			app, _ := testApp(t)
 			req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode="+mode, nil)
-			req.Header.Set("X-Consumer-ID", "researcher")
+			req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 			rec := httptest.NewRecorder()
 			app.routes().ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
@@ -386,9 +523,9 @@ func TestLedgerRefusesNewConsumersAtCapacity(t *testing.T) {
 		t.Fatalf("existing consumer snapshot: remaining=%v full=%v err=%v", remaining, full, err)
 	}
 
-	app := &App{ledger: ledger}
+	app := &App{ledger: ledger, consumerTokenHashes: map[[32]byte]string{sha256.Sum256([]byte(testResearcherToken)): "researcher"}}
 	req := httptest.NewRequest(http.MethodGet, "/budget", nil)
-	req.Header.Set("X-Consumer-ID", "one-too-many")
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -446,6 +583,37 @@ func TestSQLiteBudgetPersistsAfterCloseAndReopen(t *testing.T) {
 	}
 }
 
+func TestStoppedSQLiteDatabaseCopyCanBeRestoredSeparately(t *testing.T) {
+	originalPath := filepath.Join(t.TempDir(), "original.db")
+	ledger, err := OpenBudgetLedger(originalPath, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, charged, _, err := ledger.Charge("researcher", 1); err != nil || !charged {
+		t.Fatalf("charge before backup: charged=%v err=%v", charged, err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := os.WriteFile(restoredPath, backup, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := OpenBudgetLedger(restoredPath, 5)
+	if err != nil {
+		t.Fatalf("open restored copy: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	remaining, full, err := restored.Snapshot("researcher")
+	if err != nil || full || remaining != 4 {
+		t.Fatalf("restored balance: remaining=%v full=%v err=%v", remaining, full, err)
+	}
+}
+
 func TestSQLiteAPIBudgetPersistsAcrossApplicationRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "api-persistence.db")
 	opa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -463,7 +631,7 @@ func TestSQLiteAPIBudgetPersistsAcrossApplicationRestart(t *testing.T) {
 	request := func(app *App, target string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, target, nil)
-		req.Header.Set("X-Consumer-ID", "researcher")
+		req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 		rec := httptest.NewRecorder()
 		app.routes().ServeHTTP(rec, req)
 		return rec
@@ -519,7 +687,7 @@ func TestDatabaseWriteFailureDoesNotReturnProtectedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=coarse", nil)
-	req.Header.Set("X-Consumer-ID", "researcher")
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 	rec := httptest.NewRecorder()
 	app.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -541,7 +709,7 @@ func TestClosedDatabaseFailsBudgetAndReadinessChecks(t *testing.T) {
 	for _, path := range []string{"/budget", "/readyz"} {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
-			req.Header.Set("X-Consumer-ID", "researcher")
+			req.Header.Set("Authorization", "Bearer "+testResearcherToken)
 			rec := httptest.NewRecorder()
 			app.routes().ServeHTTP(rec, req)
 			if rec.Code != http.StatusServiceUnavailable {
