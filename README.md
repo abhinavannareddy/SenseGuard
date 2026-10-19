@@ -296,7 +296,7 @@ The token-map JSON maps consumer IDs to unique random tokens of at least 32 char
 
 The PVC leaves `storageClassName` unset, so the cluster needs a default dynamic StorageClass. The storage driver must support `fsGroup: 65532`. The app and OPA require externally created TLS Secrets and a consumer-credentials Secret; no secret material is included in this repository. OPA requires a client certificate and validates it against its configured CA. NetworkPolicies restrict OPA ingress to SenseGuard and API ingress to client pods labeled `senseguard.io/client=true` in namespaces labeled `senseguard.io/allow-senseguard=true`; enforcement depends on the CNI. Apply those labels only to reviewed client workloads. The app Service is ClusterIP-only. No ingress is configured.
 
-Future commands only — **NOT EXECUTED** (they change a cluster):
+Future commands only (**NOT EXECUTED**; they change a cluster):
 
 ```powershell
 # After the namespace, ConfigMap, and required Secrets above exist:

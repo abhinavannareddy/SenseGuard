@@ -2,7 +2,7 @@
 
 This checklist records repository verification only. No staging, production, cloud, or Kubernetes deployment has been performed. The current verdict remains **A. NOT READY FOR STAGING**.
 
-## Verification on the current working tree — 2026-10-19
+## Verification of the current working tree, 2026-10-19
 
 - [x] `go mod verify` passed with Go 1.26.9; all modules verified.
 - [x] `go test ./cmd/senseguard/...` passed with Go 1.26.9.
