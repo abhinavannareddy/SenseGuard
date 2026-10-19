@@ -586,7 +586,45 @@ func envFloat(name string, fallback float64) float64 {
 
 func finitePositive(n float64) bool { return n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
 
+func runDatabaseCommand(args []string) error {
+	if len(args) == 2 && args[0] == "verify-db" {
+		return verifySQLiteDatabase(args[1])
+	}
+	if len(args) == 2 && args[0] == "backup" {
+		databasePath := strings.TrimSpace(os.Getenv("DATABASE_PATH"))
+		if databasePath == "" {
+			databasePath = filepath.Join("data", "senseguard.db")
+		}
+		info, err := os.Stat(databasePath)
+		if err != nil {
+			return fmt.Errorf("source database is unavailable: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return errors.New("source database must be a non-empty regular file")
+		}
+		if err := verifySQLiteDatabase(databasePath); err != nil {
+			return fmt.Errorf("verify source database: %w", err)
+		}
+		ledger, err := OpenBudgetLedger(databasePath, 5)
+		if err != nil {
+			return fmt.Errorf("open source database: %w", err)
+		}
+		defer ledger.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return ledger.BackupTo(ctx, args[1])
+	}
+	return errors.New("usage: senseguard backup <new-destination-file> | senseguard verify-db <database-file>")
+}
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "backup" || os.Args[1] == "verify-db") {
+		if err := runDatabaseCommand(os.Args[1:]); err != nil {
+			log.Printf("database command failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		client := &http.Client{Timeout: 2 * time.Second}
 		if err := checkReadiness(client, "http://127.0.0.1:8080/readyz"); err != nil {

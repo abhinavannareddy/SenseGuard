@@ -23,6 +23,7 @@ var errInvalidConsumer = errors.New("invalid consumer ID")
 type BudgetLedger struct {
 	mu      sync.Mutex
 	db      *sql.DB
+	path    string
 	initial float64
 }
 
@@ -62,7 +63,7 @@ func OpenBudgetLedger(path string, initial float64) (*BudgetLedger, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	ledger := &BudgetLedger{db: db, initial: initial}
+	ledger := &BudgetLedger{db: db, path: path, initial: initial}
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("configure SQLite busy timeout: %w", err)
@@ -81,6 +82,92 @@ func OpenBudgetLedger(path string, initial float64) (*BudgetLedger, error) {
 		return nil, fmt.Errorf("check SQLite database: %w", err)
 	}
 	return ledger, nil
+}
+
+// BackupTo creates a consistent SQLite snapshot at a new path without
+// overwriting an existing file. The destination directory must already exist.
+func (b *BudgetLedger) BackupTo(ctx context.Context, destination string) error {
+	if strings.TrimSpace(destination) == "" || destination != strings.TrimSpace(destination) {
+		return errors.New("backup destination is invalid")
+	}
+	sourcePath, err := filepath.Abs(b.path)
+	if err != nil {
+		return fmt.Errorf("resolve database path: %w", err)
+	}
+	destinationPath, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("resolve backup path: %w", err)
+	}
+	samePath := filepath.Clean(sourcePath) == filepath.Clean(destinationPath)
+	if runtime.GOOS == "windows" {
+		samePath = strings.EqualFold(filepath.Clean(sourcePath), filepath.Clean(destinationPath))
+	}
+	if samePath {
+		return errors.New("backup destination must differ from the source database")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.db == nil {
+		return errors.New("database is closed")
+	}
+	file, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("create backup without overwriting: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := file.Chmod(0600); err != nil {
+			_ = file.Close()
+			_ = os.Remove(destinationPath)
+			return fmt.Errorf("restrict backup file permissions: %w", err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(destinationPath)
+		return fmt.Errorf("close new backup file: %w", err)
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.Remove(destinationPath)
+		}
+	}()
+	if _, err := b.db.ExecContext(ctx, "VACUUM INTO ?", destinationPath); err != nil {
+		return fmt.Errorf("create SQLite snapshot: %w", err)
+	}
+	if err := verifySQLiteDatabase(destinationPath); err != nil {
+		return fmt.Errorf("verify SQLite snapshot: %w", err)
+	}
+	complete = true
+	return nil
+}
+
+// verifySQLiteDatabase checks database integrity and the expected ledger table.
+func verifySQLiteDatabase(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat database: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return errors.New("database file is not a non-empty regular file")
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	var integrity string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		return fmt.Errorf("run SQLite integrity check: %w", err)
+	}
+	if integrity != "ok" {
+		return errors.New("SQLite integrity check failed")
+	}
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM privacy_budgets").Scan(&count); err != nil {
+		return fmt.Errorf("verify privacy budget table: %w", err)
+	}
+	return nil
 }
 
 func (b *BudgetLedger) Close() error {

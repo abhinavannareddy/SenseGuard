@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: senseguard-from-approved-clients
+  namespace: senseguard
+spec:
+  podSelector:
+    matchLabels:
+      app: senseguard
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              senseguard.io/allow-senseguard: "true"
+          podSelector:
+            matchLabels:
+              senseguard.io/client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080

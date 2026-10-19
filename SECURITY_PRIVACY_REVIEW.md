@@ -4,44 +4,53 @@ Date: 2026-10-19. This is a source/configuration review, not a penetration test.
 
 ## Implemented controls
 
-- `/sensing` and `/budget` require bearer credentials. Identity is derived from the matching secret token, not `X-Consumer-ID`. Mismatched caller claims are rejected. Tokens must be unique and at least 32 characters, are hashed in memory for lookup, and are not logged. Production credentials are supplied from an external secret configuration; none are committed.
-- `REQUIRE_TLS` rejects malformed values instead of treating typos as disabled TLS. Any configured OPA TLS material requires an HTTPS OPA URL; required TLS needs the CA and client certificate/key. Duplicate Authorization headers are rejected. The OPA TLS client trusts only the CA configured for OPA.
-- Kubernetes requires API HTTPS and HTTPS with mutual TLS to OPA. The API verifies OPA's server certificate against a configured CA. OPA requires a client certificate, and its `system.authz` policy pins the certificate subject to `CN=senseguard-api`; it grants only the policy decision and `/health` endpoints. SenseGuard explicitly enforces TLS 1.2 or newer; OPA uses its configured TLS listener defaults, which must be checked against transport-security requirements for the target environment.
-- Kubernetes OPA ingress is restricted to SenseGuard pods by a NetworkPolicy. This depends on a CNI that enforces NetworkPolicy. The app Service is ClusterIP-only; no Ingress is defined.
-- Compose ports bind to localhost. Its OPA API uses HTTP inside the Compose network and does not authenticate API clients, so Compose is local development only. Its health check evaluates a known allowed policy decision, confirms the authorization policy is loaded, and calls OPA's loopback-only diagnostic `/health` endpoint; SenseGuard readiness checks SQLite and OPA health.
-- OPA authorization runs before budget charging. OPA transport failures, timeouts, non-200 responses, malformed JSON, and missing decisions fail closed.
-- SQLite statements are parameterized. Budget updates are transactional, validate finite positive costs, and return data only after a confirmed commit.
-- The SenseGuard image runs as non-root. Compose uses a read-only root filesystem, drops all capabilities, applies CPU/memory limits, and enables no-new-privileges. Kubernetes containers run non-root, disable service-account token mounting, use read-only roots, drop capabilities, apply seccomp and resource limits. The SQLite ledger is designed for a single SenseGuard replica.
-- Coarse mode rounds coordinates and redacts IDs. Aggregate mode returns counts. Noisy mode samples Laplace-shaped demonstration noise with Go's cryptographically secure random source and fails closed if random generation fails; this does not provide formal differential privacy.
+- `/sensing` and `/budget` require bearer credentials. Identity is derived from the matching secret token, not `X-Consumer-ID`; mismatched claims are rejected. Tokens must be unique and at least 32 characters, are hashed in memory, and are not logged. Production token issuance, storage, rotation, and revocation remain operator responsibilities.
+- `REQUIRE_TLS` rejects malformed values and requires API TLS plus OPA CA and client certificates. Any OPA TLS material forces an HTTPS OPA URL. The OPA client trusts only the configured CA.
+- Kubernetes configures API HTTPS and mTLS from SenseGuard to OPA. OPA pins the client subject to `CN=senseguard-api` and authorizes only the policy decision and health endpoint. The app enforces TLS 1.2 or newer. The target PKI, certificate rotation, DNS names, and target TLS policy have not been verified.
+- Kubernetes NetworkPolicies restrict OPA ingress to SenseGuard and API ingress to client pods explicitly labeled in approved namespaces. NetworkPolicy enforcement depends on the target CNI, and policies are additive if other policies also select these pods. The app Service is ClusterIP-only; no Ingress is defined.
+- The root Kustomize set generates the OPA ConfigMap from the same tested files under `policy/`, and the content hash triggers a rollout when policies change. Kubernetes startup probes allow initialization before liveness/readiness checks take over.
+- OPA telemetry is disabled in Compose and Kubernetes; the pinned OPA 1.0.0 CLI advertises the configured flag.
+- Compose ports bind to localhost and its API-to-OPA connection uses unauthenticated HTTP on the private Compose network. Compose is local development only.
+- OPA authorization runs before budget charging. OPA failures, timeouts, non-200 responses, malformed JSON, and missing decisions fail closed. The service returns data only after a confirmed budget commit.
+- SQLite statements are parameterized; budget updates are transactional; invalid cost values are rejected. Database files and generated snapshots use restrictive POSIX permissions where available.
+- The `backup` command uses SQLite `VACUUM INTO`, refuses to overwrite an existing path, and verifies snapshot integrity and ledger schema. A separate restore test checks the expected balance. This does not configure automated or off-site backups.
+- Containers run non-root with read-only root filesystems, dropped capabilities, no-new-privileges, seccomp, and resource limits. SQLite is a single-replica ledger.
+- Coarse mode rounds coordinates and redacts IDs; aggregate mode returns counts. Noisy mode uses cryptographic randomness for demo noise but does not provide formal differential privacy.
+- A GitHub Actions verification workflow runs tests, OPA checks, image build, Compose validation, and Kubernetes schema validation with `contents: read`; it does not deploy or publish images. The workflow was linted locally but its first GitHub-hosted run is pending.
 
-Current-source verification passed on 2026-10-19 using Go 1.24.13 and OPA 1.0.0 containers: Go tests, vet, race tests, 70.3% coverage, and all 16 OPA tests. Compose configuration, Docker image build, local Kustomize rendering, and an isolated runtime smoke test also passed. The runtime test confirmed authentication failures, caller identity mismatch rejection, denied requests not charging budget, budget exhaustion, readiness, and fail-closed behavior when OPA stops. It used temporary credentials and a tmpfs database; no existing database or volume was touched. See `VERIFICATION_REPORT.md` for commands and detailed scope.
+## Verification on the current working tree
+
+Go 1.26.9 application tests, `go vet`, and race tests passed; statement coverage is 70.5%. `go mod verify` passed, and `govulncheck` v1.1.4 reported no known vulnerabilities for the final Go 1.26.9 toolchain and module set. Go 1.24.13 scanning had identified standard-library vulnerabilities and `golang.org/x/sys` v0.34.0 was affected by a module advisory; the toolchain and `x/sys` were upgraded. OPA 1.0.0 tests passed 16/16. A Go mTLS integration test with ephemeral certificates passed and verifies the OPA server CA and client certificate exchange; it does not validate deployment PKI. Compose config validation, Docker build, Kustomize render, strict Kubeconform validation (9 valid resources), and actionlint passed. An isolated runtime test verified 401 unauthenticated access, 403 identity mismatch and policy denial, no charge on denial, allowed requests, 429 budget exhaustion, an online SQLite snapshot, and 503 fail-closed behavior during OPA outage. The Go backup tests verify non-overwrite, restoration of the expected balance, and rejection of an invalid source without changing its bytes. No existing database or named volume was mounted or changed. GitHub-hosted CI and deployment behavior remain unverified; details are in `VERIFICATION_REPORT.md`.
 
 ## Remaining risks and deployment limits
 
-- Bearer credentials are static until rotated. Their secure issuance, distribution, revocation, and storage are operational responsibilities. Kubernetes Secrets need encryption at rest and least-privilege RBAC. No identity provider or token refresh is integrated.
-- The Kubernetes app Service is ClusterIP-only. There is no external Ingress, DNS, certificate issuance, or firewall configuration. Any external access requires a separately reviewed TLS-preserving/reencrypting gateway and network policy.
-- Kubernetes OPA TLS authentication validates certificates issued by the configured CA, and its authorization policy pins the client subject. Restrict issuance of `CN=senseguard-api` to SenseGuard and protect CA keys. NetworkPolicy enforcement depends on the target CNI.
-- Compose remains HTTP development only and must stay on a trusted local machine. Do not use it for untrusted callers.
-- No formal differential privacy. The budget is a per-request counter, not epsilon accounting. Noise has no defined sensitivity, neighboring-data model, or accountant. Coarse output retains types/counts, and small aggregates can expose individuals.
-- Backup/recovery is not validated. The persistent volume is not a backup. SQLite is not application-encrypted.
-- Kubernetes schema validation and target-cluster behavior are not verified. StorageClass, volume permissions, `fsGroup`, Secret encryption, CNI policy enforcement, image availability, and persistence require target validation. Keep one app replica.
-- Logs can include authenticated consumer IDs and purposes. Resource values have not been load-tested.
+- Bearer credentials are static until rotated. No identity provider or token refresh is integrated. Configure Kubernetes Secret encryption at rest and least-privilege RBAC; establish issuance, revocation, and rotation procedures.
+- The Service is internal and there is no external Ingress, DNS, firewall, or gateway configuration. Any external access requires a reviewed gateway with TLS handling, authentication, and rate limiting.
+- No target-issued TLS certificates or actual target-cluster TLS/mTLS handshake has been verified. The passing local handshake test uses ephemeral test certificates only. Protect the CA and restrict issuance of the pinned OPA client identity to SenseGuard.
+- NetworkPolicy CNI enforcement and approved client namespace/pod labels need target verification.
+- No formal differential privacy. The budget is a per-request counter, not epsilon accounting. Noise has no approved sensitivity, neighboring-data model, or accountant. Coarse responses retain types/counts, and small aggregates can expose individuals.
+- Backups are not scheduled or exported to independent storage by the application. RPO/RTO, retention, access control, and a target storage recovery drill remain unverified. SQLite is not application-encrypted.
+- The Kubernetes schema check uses upstream schemas but is not tied to a target Kubernetes version and is not an API-server dry run. StorageClass, volume ownership, `fsGroup`, image availability, persistence, and CNI behavior require target validation. Keep one app replica.
+- The deployment manifest still uses `senseguard:local`; a reviewed registry image and immutable digest are needed for a cluster rollout.
+- Logs can include authenticated consumer IDs and purposes. Resource values have not been load-tested; monitoring, retention/redaction, capacity planning, and incident response are incomplete.
+- The application serves simulated sensing data only. A reviewed data source, legal basis, privacy model, and retention policy are required before any real sensing data is processed.
 
-## Required before any staging rollout
+## Required before restricted staging
 
-1. Re-run the passing Go tests, race tests, vet, OPA tests, Compose validation, and Docker build in release CI against the exact release commit.
-2. Validate rendered manifests against the target Kubernetes API schema; verify the target CNI enforces NetworkPolicy and confirm the cluster's supported TLS policy.
-3. Provide trusted API, OPA server, OPA client, and CA certificates using approved secret management; verify DNS names, OPA client subject `CN=senseguard-api`, trust chains, expiry, and rotation with the target environment.
-4. Provision consumer bearer tokens through an identity owner; configure Secret encryption/RBAC and establish issuance, revocation, and rotation procedures.
-5. Run an environment-specific SQLite backup and restore drill against a separate database and set recovery objectives.
-6. Complete restricted staging validation for certificates, authentication, authorization, OPA outage, budget exhaustion, storage persistence, monitoring, and rollback before any staging rollout.
+1. Confirm the GitHub Actions workflow passes for the exact release commit.
+2. Validate the rendered manifests against the target Kubernetes version and admission policies.
+3. Issue and test the API/OPA certificates through approved PKI; verify DNS SANs, trust chains, expiry, rotation, and the OPA client subject.
+4. Provision consumer tokens through an identity owner and protect them with approved secret management, RBAC, revocation, and rotation.
+5. Verify the target CNI, approved client labels, storage class, volume permissions, and persistence.
+6. Export an online SQLite snapshot to independent protected storage and complete a restore drill with recovery objectives.
+7. Complete monitoring, logging/retention, gateway abuse controls, rollback, and restricted staging runtime validation.
 
 ## Required before production
 
-Define a reviewed privacy model/accountant before making formal privacy claims; complete threat modeling, rate limiting and abuse controls at the approved gateway, monitoring and retention/log safeguards, measured capacity planning, target-cluster storage validation, and independent security/privacy review. Establish a supported shared budget design before scaling beyond one app replica.
+Complete threat modeling and independent security/privacy review, capacity/load validation, incident and recovery procedures, and production PKI/identity operations. For real sensing data, approve a privacy model and legal/retention controls; build and validate a formal accountant before making any differential-privacy claim. Establish a supported shared budget design before scaling beyond one API replica.
 
 The OPA authentication and authorization configuration follows the [OPA security guidance](https://www.openpolicyagent.org/docs/security), which distinguishes client TLS authentication from API authorization and documents the request identity and path fields used by `system.authz`.
 
 ## Verdict
 
-**NOT YET READY FOR STAGING ROLLOUT OR PRODUCTION.** Local code, container, and simulated runtime checks pass. Real credentials and certificates, Kubernetes schema and target-cluster verification, storage and recovery validation, and the staging operational plan remain outstanding.
+**NOT YET READY FOR STAGING ROLLOUT OR PRODUCTION.** Repository controls and local checks improved, but target credentials, PKI, cluster policy/storage behavior, image publication, independent recovery, production operations, and privacy review remain outstanding.

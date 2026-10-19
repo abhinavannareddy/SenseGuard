@@ -14,6 +14,7 @@ spec:
         app: senseguard
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
       securityContext:
         fsGroup: 65532
         seccompProfile:
@@ -78,6 +79,16 @@ spec:
               scheme: HTTPS
             initialDelaySeconds: 2
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+              scheme: HTTPS
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
           livenessProbe:
             httpGet:
               path: /healthz

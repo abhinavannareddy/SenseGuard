@@ -24,6 +24,7 @@ spec:
           args:
             - run
             - --server
+            - --disable-telemetry
             - --addr=https://0.0.0.0:8181
             - --diagnostic-addr=127.0.0.1:8282
             - --tls-cert-file=/tls/tls.crt
@@ -56,6 +57,19 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
+          startupProbe:
+            exec:
+              command:
+                - /opa
+                - eval
+                - --fail
+                - --format=raw
+                - --data=/policy/senseguard.rego
+                - --data=/policy/opa_authz.rego
+                - data.senseguard.healthcheck
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
           livenessProbe:
             exec:
               command:

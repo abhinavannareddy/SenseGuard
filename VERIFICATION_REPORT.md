@@ -1,62 +1,67 @@
 # SenseGuard verification and deployment report
 
-Date: 2026-10-19
+Date: 2026-10-19. Checks below were run against the current working tree based on commit `956a7d8`; follow-up changes are not committed yet.
 
 ## Decision
 
-**A. NOT READY FOR STAGING.** Current-source checks and an isolated local runtime smoke test pass, but production identity issuance, real certificate provisioning, Kubernetes schema/cluster validation, persistent-volume behavior, and a target-environment recovery exercise are outstanding. Use simulated data only. No staging, production, cloud, or Kubernetes deployment was performed.
+**A. NOT READY FOR STAGING.** Local code, container, policy, workflow, and upstream manifest-schema checks pass. Target-issued certificates and consumer credentials, target cluster/CNI/storage behavior, an immutable registry image, independent backup/restore operations, production monitoring, and privacy review have not been verified. Use simulated data only. No deployment was performed.
 
 ## Architecture and controls
 
-SenseGuard is a Go HTTP API that authenticates consumers using startup-configured bearer tokens, asks OPA to authorize purpose and privacy mode, transforms simulated sensing data, and charges a per-consumer SQLite ledger before returning a response. `/budget` uses the same authenticated identity as `/sensing`; `X-Consumer-ID` cannot select another account. OPA and database failures fail closed. The ledger is a single-instance design.
+SenseGuard is a Go HTTP API that authenticates consumers using startup-configured bearer tokens, asks OPA to authorize purpose and mode, transforms simulated sensing data, and charges a per-consumer SQLite ledger before returning data. `/budget` uses the authenticated identity; `X-Consumer-ID` cannot select another account. OPA and database failures fail closed. SQLite supports one API replica.
 
-Compose is a localhost-only development profile. API-to-OPA traffic is HTTP on its private Compose network, and the OPA API does not authenticate Compose clients. Its health check evaluates an expected policy decision, confirms the authorization policy is loaded, and checks OPA's loopback diagnostic endpoint. SenseGuard readiness checks SQLite and OPA. Containers use non-root execution, read-only root filesystems, dropped capabilities, no-new-privileges, and resource limits. `.dockerignore` limits the build context to the Dockerfile, Go module files, and application source.
+Compose is a localhost-only development profile. API-to-OPA traffic is HTTP on its private Compose network; the OPA API does not authenticate Compose clients. Both containers are non-root and restricted. The meaningful OPA health check tests a policy decision and its loopback diagnostic endpoint. OPA telemetry is disabled.
 
-The Kubernetes manifests are preparation only. They configure API HTTPS and mTLS to OPA; OPA pins the client certificate subject to `CN=senseguard-api` and limits API access to the policy decision and health endpoints. NetworkPolicy enforcement depends on the cluster CNI. The Service is internal, no Ingress is configured, and the SQLite PVC is not a backup.
+The root Kustomize set generates its OPA ConfigMap from the same Rego files under `policy/`, with a content hash that triggers rollout when policy changes. Kubernetes configures HTTPS for the API and mTLS plus OPA API authorization from SenseGuard to OPA. NetworkPolicies restrict OPA ingress to SenseGuard and API ingress to explicitly labeled client pods in approved namespaces. Network enforcement depends on the target CNI. The API Service is internal ClusterIP; no Ingress is configured. Kubernetes still uses `senseguard:local`, which must be replaced with a reviewed registry image pinned by digest before rollout.
 
-The README includes request-flow and deployment-topology diagrams and illustrative privacy-mode images. They describe demo behavior and do not claim a formal privacy guarantee.
+The database backup command uses `VACUUM INTO` to create a consistent online snapshot at a new, non-overwriting path, then checks SQLite integrity and the expected ledger table. The destination directory must exist and be writable. The command does not schedule backups, export them off-volume, or define retention/recovery objectives.
 
-## Checks on the current source
-
-All checks below completed on 2026-10-19. Go and OPA ran from versioned containers because host binaries are not installed. The repository was mounted read-only for Go tests; OPA policy files were mounted read-only.
+## Checks executed on the current working tree
 
 | Check | Result |
 |---|---|
-| `go test ./...` with Go 1.24.13 | PASS, application package and one ignored historical audit copy |
-| `go test ./cmd/senseguard/...` with Go 1.24.13 | PASS |
-| `go vet ./cmd/senseguard/...` with Go 1.24.13 | PASS, no diagnostics |
-| `go test -race ./cmd/senseguard/...` with Go 1.24.13 | PASS |
-| `go test -cover ./cmd/senseguard/...` with Go 1.24.13 | PASS, 70.3% statement coverage |
-| OPA 1.0.0 `opa test policy -v` | PASS, 16/16 tests |
-| `docker compose config --quiet` with a temporary token map | PASS |
-| `docker build -t senseguard:verify-20261019 .` | PASS |
-| `kubectl kustomize .\k8s` | PASS, local render only |
-| Isolated Docker runtime smoke checks | PASS, details below |
+| `go mod verify` with Go 1.26.9 | PASS, all modules verified |
+| `go test ./cmd/senseguard/...` with Go 1.26.9 | PASS |
+| `go vet ./cmd/senseguard/...` with Go 1.26.9 | PASS, no diagnostics |
+| `go test -race ./cmd/senseguard/...` with Go 1.26.9 | PASS |
+| `go test -cover ./cmd/senseguard/...` with Go 1.26.9 | PASS, 70.5% statement coverage |
+| `govulncheck` v1.1.4 with Go 1.26.9 | PASS, no known vulnerabilities reported in reachable code or required modules |
+| OPA 1.0.0 `opa test /policy -v` | PASS, 16/16 |
+| OPA 1.0.0 `run --help` telemetry flag check | PASS, `--disable-telemetry` supported |
+| `docker compose config --quiet` with a non-production temporary token map | PASS |
+| `docker build -t senseguard:verify-20261019-go1269 .` | PASS; resulting image is present locally |
+| `kubectl kustomize .` | PASS; root Kustomize render uses source policies |
+| Strict Kubeconform validation | PASS, 9 valid resources, 0 invalid |
+| `actionlint` on `.github/workflows/verify.yml` | PASS |
+| Isolated Docker runtime smoke test | PASS; results below |
+| SQLite online backup and separate restore unit test | PASS |
+| Backup CLI rejects an invalid source without changing its bytes | PASS |
+| Go mTLS integration test using an ephemeral local test CA | PASS; OPA server identity is verified and a client certificate is presented |
 
-The isolated runtime used a new temporary network, the newly built image, random throwaway credentials, a localhost-only published port, and a tmpfs database. It did not mount or modify the existing Compose volume or any database. Verified `/healthz` and `/readyz` (200); missing/invalid credentials (401); caller identity mismatch (403); authenticated budget lookup; invalid mode (400); allowed noisy request (200); denied policy request (403) with no budget charge; exhausted budget (429); and readiness plus sensing failure (503) after stopping the test OPA container. The OPA health-check policy itself evaluated successfully. Only the temporary test containers were stopped afterward.
+Go 1.24.13's standard library scan identified known vulnerabilities, including a remotely triggerable HTTP/2 server crash. The project was moved to Go 1.26.9 and `golang.org/x/sys` was upgraded to v0.44.0; the final Go 1.26.9 `govulncheck` run reported no known vulnerabilities. A scan with Go 1.27.2 could not be completed because the pinned scanner's parser panicked on that newer Go syntax, so the checked and pinned toolchain is Go 1.26.9. The initial Alpine race-detector attempt lacked cgo; the final Go 1.26.9 race run passed. Go checks ran in disposable containers against the current project source; no persistent database volume was mounted.
 
-`kubectl kustomize` parsed and rendered the manifest set, but Kubernetes API schema validation and cluster behavior were not tested. No cluster was contacted. TLS/mTLS handshakes, a real identity provider or token lifecycle, CNI enforcement, storage ownership, image pull from a registry, and real PVC persistence remain unverified.
+Kubeconform validated the rendered resources against upstream schemas. This did not contact an API server and is not validation against a selected target Kubernetes version. The GitHub Actions workflow is verification-only with `contents: read`; it was linted locally but has not run on GitHub yet. The Docker image build uses the patched Go 1.26.9 builder. Local Compose remains HTTP-only, loopback-bound, and intended for development.
 
-## Backup and recovery
+The isolated runtime used a unique temporary network, random throwaway credentials, and a tmpfs database. `/readyz` returned 200; missing credentials returned 401; identity mismatch and policy denial returned 403; the denied request did not charge budget; allowed requests returned 200; an exhausted budget returned 429; the online backup and integrity check succeeded; and after OPA stopped, readiness and sensing returned 503. Temporary containers and the network were removed. No existing Docker volume or database was mounted or changed.
 
-The Go suite includes a backup/restore test using a separate temporary SQLite database copy and verifies the restored database. This does not validate copying a live or mounted deployment database, backup scheduling, retention, restore objectives, or recovery in a target environment. The README documents an offline, non-overwriting file-copy procedure and restoration to a separate test location. Existing databases and Docker volumes were not used or changed in this verification pass.
+The Go test creates a snapshot while the ledger is open, verifies integrity, refuses an existing destination without modifying it, restores the snapshot to another temporary file, and checks that the known balance is preserved.
 
 ## Security and privacy limits
 
-Consumer identity comes from the bearer token map, not a caller-supplied identity header. TLS configuration rejects OPA HTTP downgrade when OPA TLS files or `REQUIRE_TLS` are configured. Noisy demo mode uses `crypto/rand` and fails closed if random generation fails; the distribution has no approved sensitivity, neighboring-data definition, epsilon/delta accountant, or composition model. Coarse output retains types/counts, and small aggregates may reveal individuals. No formal differential-privacy claim is supported.
+Consumer identity comes from a bearer-token map; tokens still need secure issuance, delivery, revocation, rotation, and Secret management. No identity provider is integrated. A Go integration test with ephemeral test-only certificates verifies that SenseGuard trusts its configured OPA CA and presents a client certificate to an mTLS OPA endpoint. This does not validate real target certificates, trust chains, renewal, DNS names, or target TLS policy. Compose is not safe for untrusted network callers.
 
-Static bearer tokens still need approved issuance, secure delivery, rotation, revocation, and least-privilege storage. Compose must remain restricted to the local machine and is not suitable for untrusted callers. Production also requires target-cluster threat review, monitoring and retention controls, measured capacity, tested recovery objectives, and independent security/privacy review. Keep one API replica with this SQLite ledger.
+No formal differential-privacy guarantee is established. The ledger is a per-request counter rather than epsilon/delta accounting; noise lacks an approved sensitivity, neighboring-data model, and composition accountant. Coarse output retains object types/counts, and small aggregates can expose individuals. The app currently returns simulated data only.
 
-## Secret and change review
+Production operations remain unverified: target PVC and `fsGroup` behavior, CNI NetworkPolicy enforcement, independent backup retention and recovery objectives, monitoring/log retention, rate limiting, measured capacity, rollback, and independent security/privacy review. Keep one API replica.
 
-Targeted scans of the 12 changed text files and the published commit found no matches for private-key headers, common GitHub/AWS/Google/Slack token formats, JWT-like strings, literal bearer credentials, or common email, US phone, and SSN patterns. No dedicated secret-scanning tool is installed, and pattern scanning cannot establish that a file contains no sensitive information. The staged patch was manually reviewed and `git diff --cached --check` passed. Ignored archives, backups, database files, and audit copies are excluded from the commit and Docker build context. `.gitignore` excludes environment files, tokens, certificates/keys, database files, backup directories, and ZIP archives. `git diff --check` passed for the current worktree.
+## Secret, artifact, and change review
 
-The release Go command intentionally targets `./cmd/senseguard/...`. The separate `go test ./...` run also discovered and passed one ignored audit-copy package. Three ignored snapshots contain older Go source, but they are not release files and were not modified. Keeping release CI scoped to the maintained package avoids accidentally treating historical snapshots as maintained application code.
+The existing ignored backups, archives, local databases, and audit copies were left untouched. The project `.gitignore` excludes environment files, tokens, certificates/keys, local databases, backup directories, and ZIP archives. A targeted scan of changed and untracked release files found no private-key blocks, common GitHub/AWS token formats, JWT-like strings, or credential assignments. `gitleaks` is not installed, so this pattern scan cannot establish that all sensitive information is absent. `git diff --check` passed. Ignored local artifacts are outside the release file list.
 
 ## Repository release status
 
-The current branch is `master`; the configured `origin` is the requested GitHub repository. Publishing the verified changes requires a normal fast-forward push and must preserve the existing branch history and repository-owner author identity. Do not force-push or include ignored local artifacts.
+The current branch is `master` and `origin` is configured for the requested SenseGuard GitHub repository. Immediately before release preparation, `origin/master` matched local commit `956a7d8af3ae7041514b7daab9f30015cf2a8d8c`, allowing a normal fast-forward. The exact commit and push outcome are recorded in the release summary. GitHub-hosted CI must still be checked for the published commit.
 
-## Files changed in this pass
+## Follow-up files changed
 
-`.dockerignore`, `README.md`, `VERIFICATION_REPORT.md`, `SECURITY_PRIVACY_REVIEW.md`, `DEPLOYMENT_CHECKLIST.md`, `cmd/senseguard/main.go`, `cmd/senseguard/main_test.go`, `docker-compose.yml`, `k8s/opa-config.yaml`, `k8s/opa-deployment.yaml`, `policy/senseguard.rego`, and `policy/senseguard_test.rego`.
+`.github/workflows/verify.yml`, `README.md`, `DEPLOYMENT_CHECKLIST.md`, `SECURITY_PRIVACY_REVIEW.md`, `VERIFICATION_REPORT.md`, `cmd/senseguard/ledger_sqlite.go`, `cmd/senseguard/main.go`, `cmd/senseguard/main_test.go`, `docker-compose.yml`, `k8s/opa-deployment.yaml`, `k8s/senseguard-deployment.yaml`, `k8s/senseguard-networkpolicy.yaml`, and root `kustomization.yaml`. The duplicate embedded policy file `k8s/opa-config.yaml` and nested Kustomize entrypoint `k8s/kustomization.yaml` were removed because the root Kustomize generator now consumes the canonical `policy/` files.

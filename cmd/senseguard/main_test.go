@@ -1,12 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,6 +282,133 @@ func TestOPAConfigRequiresHTTPSWhenTLSMaterialIsConfigured(t *testing.T) {
 				t.Fatalf("validateOPAConfig() error=%v, wantErr=%t", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestOPAHTTPSClientVerifiesServerAndPresentsClientCertificate(t *testing.T) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "SenseGuard test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issueCertificate := func(commonName string, usages []x509.ExtKeyUsage, ipAddresses []net.IP) (tls.Certificate, []byte) {
+		t.Helper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
+		if err != nil {
+			t.Fatal(err)
+		}
+		template := &x509.Certificate{
+			SerialNumber: serial,
+			Subject:      pkix.Name{CommonName: commonName},
+			NotBefore:    time.Now().Add(-time.Minute),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  usages,
+			IPAddresses:  ipAddresses,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := x509.ParseCertificate(der); err != nil {
+			t.Fatal(err)
+		}
+		keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+		pair, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pair, certPEM
+	}
+	serverCert, _ := issueCertificate("opa.test", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []net.IP{net.ParseIP("127.0.0.1")})
+	clientCert, clientCertPEM := issueCertificate("senseguard-api", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(caCert)
+	opa := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) != 1 || r.TLS.PeerCertificates[0].Subject.CommonName != "senseguard-api" {
+			http.Error(w, "expected SenseGuard client certificate", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":true}`))
+	}))
+	opa.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		MinVersion:   tls.VersionTLS12,
+	}
+	opa.StartTLS()
+	t.Cleanup(opa.Close)
+
+	directory := t.TempDir()
+	caPath := filepath.Join(directory, "ca.pem")
+	clientCertPath := filepath.Join(directory, "client.pem")
+	clientKeyDER, err := x509.MarshalPKCS8PrivateKey(clientCert.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKeyPath := filepath.Join(directory, "client-key.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientCertPath, clientCertPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientKeyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: clientKeyDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := newTestApplication(t, Config{
+		OPAURL:            opa.URL,
+		RequireTLS:        true,
+		OPACertFile:       caPath,
+		OPAClientCertFile: clientCertPath,
+		OPAClientKeyFile:  clientKeyPath,
+	})
+
+	ready := httptest.NewRecorder()
+	app.routes().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("mTLS readiness: want 200, got %d: %s", ready.Code, ready.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=aggregate", nil)
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
+	response := httptest.NewRecorder()
+	app.routes().ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("mTLS-authorized sensing: want 200, got %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -680,6 +817,78 @@ func TestStoppedSQLiteDatabaseCopyCanBeRestoredSeparately(t *testing.T) {
 	remaining, full, err := restored.Snapshot("researcher")
 	if err != nil || full || remaining != 4 {
 		t.Fatalf("restored balance: remaining=%v full=%v err=%v", remaining, full, err)
+	}
+}
+
+func TestSQLiteBackupCreatesVerifiedSeparateSnapshotWithoutOverwrite(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	backupPath := filepath.Join(directory, "backup.db")
+	ledger, err := OpenBudgetLedger(sourcePath, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ledger.Close() })
+	if _, charged, _, err := ledger.Charge("researcher", 1); err != nil || !charged {
+		t.Fatalf("charge before backup: charged=%v err=%v", charged, err)
+	}
+	if err := ledger.BackupTo(context.Background(), backupPath); err != nil {
+		t.Fatalf("create backup: %v", err)
+	}
+	if err := verifySQLiteDatabase(backupPath); err != nil {
+		t.Fatalf("verify backup: %v", err)
+	}
+	if remaining, _, err := ledger.Snapshot("researcher"); err != nil || remaining != 4 {
+		t.Fatalf("source balance changed during backup: remaining=%v err=%v", remaining, err)
+	}
+	backupBytes, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.BackupTo(context.Background(), backupPath); err == nil {
+		t.Fatal("expected an existing backup destination to be rejected")
+	}
+	if after, err := os.ReadFile(backupPath); err != nil || !bytes.Equal(after, backupBytes) {
+		t.Fatalf("existing backup changed after rejected overwrite: err=%v", err)
+	}
+
+	restoredPath := filepath.Join(directory, "restored.db")
+	if err := os.WriteFile(restoredPath, backupBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySQLiteDatabase(restoredPath); err != nil {
+		t.Fatalf("verify restored database: %v", err)
+	}
+	restored, err := OpenBudgetLedger(restoredPath, 99)
+	if err != nil {
+		t.Fatalf("open restored database: %v", err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	if remaining, _, err := restored.Snapshot("researcher"); err != nil || remaining != 4 {
+		t.Fatalf("restored balance = %v, want 4: %v", remaining, err)
+	}
+}
+
+func TestBackupCommandRejectsInvalidSourceWithoutChangingIt(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "not-a-senseguard-database.db")
+	sourceBytes := []byte("preserve this unrelated file")
+	if err := os.WriteFile(sourcePath, sourceBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_PATH", sourcePath)
+	destination := filepath.Join(t.TempDir(), "backup.db")
+	if err := runDatabaseCommand([]string{"backup", destination}); err == nil {
+		t.Fatal("expected backup command to reject a non-SenseGuard database")
+	}
+	after, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, sourceBytes) {
+		t.Fatal("invalid source database was modified")
+	}
+	if _, err := os.Stat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid source created a backup file: stat error=%v", err)
 	}
 }
 

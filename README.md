@@ -8,7 +8,7 @@
 <p align="center"><a href="SECURITY_PRIVACY_REVIEW.md">Security review</a> · <a href="VERIFICATION_REPORT.md">Verification report</a> · <a href="DEPLOYMENT_CHECKLIST.md">Deployment checklist</a></p>
 
 <p align="center">
-  <img alt="Go 1.24.13" src="https://img.shields.io/badge/Go-1.24.13-00ADD8?logo=go&logoColor=white" />
+  <img alt="Go 1.26.9" src="https://img.shields.io/badge/Go-1.26.9-00ADD8?logo=go&logoColor=white" />
   <img alt="OPA 1.0.0" src="https://img.shields.io/badge/Policy-OPA%201.0.0-7C4DFF" />
   <img alt="SQLite" src="https://img.shields.io/badge/Ledger-SQLite-0F80CC?logo=sqlite&logoColor=white" />
   <img alt="Prototype" src="https://img.shields.io/badge/Status-Prototype-64748B" />
@@ -61,7 +61,7 @@ flowchart TB
         clusterAPI -->|"mTLS :8181"| clusterOPA["Internal OPA service"]
         clusterOPA -->|"Decision"| clusterAPI
         clusterAPI --> clusterDB[("1 GiB PVC<br/>SQLite ledger")]
-        policyNet["NetworkPolicy<br/>SenseGuard → OPA"] -. restricts .-> clusterOPA
+        policyNet["NetworkPolicies<br/>approved clients → API; API → OPA"] -. restricts .-> clusterAPI
     end
 
     classDef app fill:#0B1F35,stroke:#22D3EE,color:#EAFBFF
@@ -141,7 +141,7 @@ Persistent storage is not a backup. Protect the volume and practice restoring ba
 
 ## Run checks
 
-Local Go checks require Go 1.24.13 or a compatible newer Go release. Direct Rego checks require OPA 1.0.0 or compatible OPA. Docker commands require Docker Desktop Engine access.
+Local Go checks use Go 1.26.9, the patched toolchain pinned by this repository. Direct Rego checks require OPA 1.0.0 or compatible OPA. Docker commands require Docker Desktop Engine access.
 
 PowerShell commands from the project root:
 
@@ -151,15 +151,18 @@ go test ./cmd/senseguard/...
 go test -race ./cmd/senseguard/...
 go vet ./cmd/senseguard/...
 go test -cover ./cmd/senseguard/...
+go mod verify
+go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/senseguard/...
 opa test policy/ -v
 docker compose config --quiet
+kubectl kustomize .
 ```
 
-The release Go commands target `./cmd/senseguard/...` so they test the maintained application package only. A root-level `go test ./...` can also discover ignored historical audit copies; that broader command passed during the 2026-10-19 verification, but snapshots are not release source. Go tests use a mocked OPA server; `opa test` checks the actual Rego files. Compose config validation does not start services. If using Docker for Go/OPA checks, official images may be downloaded when missing. Read-only mount examples:
+The release Go commands target `./cmd/senseguard/...` so they test the maintained application package only. A root-level `go test ./...` can also discover ignored historical audit copies; snapshots are not release source. Go tests use a mocked OPA server; `opa test` checks the actual Rego files. Compose config validation does not start services. `govulncheck` is the Go team's tool for checking known vulnerabilities in called code paths. The verification-only GitHub Actions workflow runs these checks, builds the image, and validates rendered Kubernetes resource schemas. It does not deploy or publish an image. Its first run is pending until GitHub executes it. If using Docker for Go/OPA checks, official images may be downloaded when missing. Read-only mount examples:
 
 ```powershell
-docker run --rm --mount "type=bind,source=$($PWD.Path),target=/workspace,readonly" --workdir /workspace golang:1.24.13-alpine go test ./cmd/senseguard/...
-docker run --rm --mount "type=bind,source=$($PWD.Path),target=/workspace,readonly" --workdir /workspace golang:1.24.13-alpine go vet ./cmd/senseguard/...
+docker run --rm --mount "type=bind,source=$($PWD.Path),target=/workspace,readonly" --workdir /workspace golang:1.26.9 go test ./cmd/senseguard/...
+docker run --rm --mount "type=bind,source=$($PWD.Path),target=/workspace,readonly" --workdir /workspace golang:1.26.9 go vet ./cmd/senseguard/...
 docker run --rm --mount "type=bind,source=$($PWD.Path)\policy,target=/policy,readonly" openpolicyagent/opa:1.0.0 test /policy -v
 ```
 
@@ -236,43 +239,24 @@ The named volume remains attached. Compare the balance before and after. This co
 
 ## Back up the database
 
-Stop the API to avoid writes, copy its DB file, then start it again. This is an offline file copy; backup/restore remains unverified:
+The application includes an online SQLite snapshot command. It uses SQLite `VACUUM INTO` to create a consistent snapshot while the API may be running, refuses to overwrite a destination, and verifies the new file's integrity and ledger schema. The destination directory must exist and be writable. See [SQLite VACUUM INTO](https://www.sqlite.org/lang_vacuum.html#vacuuminto) for the snapshot behavior.
 
 ```powershell
-docker compose stop senseguard
-try {
-    if ($LASTEXITCODE -ne 0) { throw 'Could not stop SenseGuard; check the Compose service.' }
-    $backupDir = Join-Path $PWD.Path ('backups\senseguard-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff'))
-    if (Test-Path -LiteralPath $backupDir) { throw 'Backup path already exists; choose a new path.' }
-    New-Item -ItemType Directory -Path $backupDir | Out-Null
-    $backupFile = Join-Path $backupDir 'senseguard.db'
-    if (Test-Path -LiteralPath $backupFile) { throw 'Backup file already exists; refusing to overwrite it.' }
-    docker compose cp senseguard:/data/senseguard.db $backupFile
-    if ($LASTEXITCODE -ne 0) { throw 'Database copy failed.' }
-} finally {
-    docker compose start senseguard
-    if ($LASTEXITCODE -ne 0) { throw 'Could not restart SenseGuard; check the Compose service.' }
-}
+$backupName = 'senseguard-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff') + '.db'
+$containerBackupPath = '/data/' + $backupName
+docker compose exec senseguard /senseguard backup $containerBackupPath
+if ($LASTEXITCODE -ne 0) { throw 'SQLite snapshot failed; keep the source database and inspect the error.' }
+docker compose exec senseguard /senseguard verify-db $containerBackupPath
+if ($LASTEXITCODE -ne 0) { throw 'Snapshot verification failed; do not use this backup.' }
+$backupDir = Join-Path $PWD.Path ('backups\' + [IO.Path]::GetFileNameWithoutExtension($backupName))
+if (Test-Path -LiteralPath $backupDir) { throw 'Backup export path already exists; refusing to overwrite it.' }
+New-Item -ItemType Directory -Path $backupDir | Out-Null
+$backupFile = Join-Path $backupDir $backupName
+docker compose cp ("senseguard:/data/" + $backupName) $backupFile
+if ($LASTEXITCODE -ne 0) { throw 'Could not export the snapshot to the protected host directory.' }
 ```
 
-Keep the backup protected and out of source control. Restore only to a new, separate test directory; never copy a backup over the live volume. Example using a backup path you have recorded:
-
-```powershell
-$backupFile = 'C:\secure-backups\senseguard.db'
-$restoreDir = Join-Path $env:TEMP ('senseguard-restore-test-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff'))
-if (Test-Path -LiteralPath $restoreDir) { throw 'Restore test path already exists; refusing to overwrite it.' }
-New-Item -ItemType Directory -Path $restoreDir | Out-Null
-$restoredFile = Join-Path $restoreDir 'senseguard.db'
-Copy-Item -LiteralPath $backupFile -Destination $restoredFile -ErrorAction Stop
-if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
-    $integrity = & sqlite3 $restoredFile 'PRAGMA integrity_check;'
-    if ($LASTEXITCODE -ne 0 -or $integrity -ne 'ok') { throw 'Restored database integrity check failed.' }
-} else {
-    Write-Warning 'sqlite3 is not installed; verify this copy with the application restore test or an approved SQLite tool.'
-}
-```
-
-Backup/restore against the running Compose volume has not been validated in this engineering pass. The Go test verifies a stopped database copy can be opened separately and that a known balance survives; it is not a production recovery drill.
+Keep backups protected and out of source control. The snapshot remains on the database volume until an operator-managed retention process removes it; export it promptly to storage independent from the source volume. Backups contain consumer IDs and budget balances. Restore only into a new, separate test database and verify it with `/senseguard verify-db <path>`; never overwrite the live database during a test. The command and isolated restore test do not provide backup scheduling, off-site retention, RPO/RTO, or a production recovery drill.
 
 ## Logs and troubleshooting
 
@@ -291,7 +275,7 @@ Logs omit sensing coordinates/data and bearer tokens. They may include authentic
 
 ## Kubernetes (preparation only)
 
-Files in `k8s/` define namespace, policy ConfigMap, internal OPA Deployment/Service, a 1 GiB PVC, and SenseGuard Deployment/Service. `k8s/kustomization.yaml` lets you validate or render the complete set with `kubectl kustomize .\k8s`. SenseGuard uses one replica, the DB at `/data/senseguard.db`, `/readyz` and `/healthz` probes, resource requests/limits, and non-root controls. OPA remains ClusterIP/internal.
+Files in `k8s/` define the internal OPA and SenseGuard Deployments and Services, a 1 GiB PVC, and NetworkPolicies. Root `kustomization.yaml` generates the OPA ConfigMap directly from the tested files in `policy/`, keeping deployed policy in sync with source. Run `kubectl kustomize .` to render the full set. SenseGuard uses one replica, the DB at `/data/senseguard.db`, startup/readiness/liveness probes, resource requests/limits, and non-root controls. OPA remains ClusterIP/internal.
 
 Create the namespace first, then create the required Secrets from protected files. The Kustomize set creates the ConfigMap and workloads. The Kubernetes profile expects these Secret names and keys:
 
@@ -301,20 +285,22 @@ kubectl -n senseguard create secret tls senseguard-tls --cert=<api-cert.pem> --k
 kubectl -n senseguard create secret generic opa-server-tls --from-file=tls.crt=<opa-server-cert.pem> --from-file=tls.key=<opa-server-key.pem> --from-file=ca.crt=<opa-ca.pem>
 kubectl -n senseguard create secret generic senseguard-to-opa-client --from-file=tls.crt=<client-cert.pem> --from-file=tls.key=<client-key.pem> --from-file=ca.crt=<opa-ca.pem>
 kubectl -n senseguard create secret generic senseguard-consumer-credentials --from-file=tokens=<protected-token-map.json>
-kubectl apply -k .\k8s
+kubectl apply -k .
 ```
 
-The OPA client certificate subject must be exactly `CN=senseguard-api`. The OPA server certificate must include `DNS:opa` and `DNS:opa.senseguard.svc`; the API certificate must match the DNS name used by its clients. Keep certificate private keys and token files outside the repository. `kubectl kustomize .\k8s` renders locally without contacting a cluster; schema validation and cluster behavior still need verification against the target Kubernetes version.
+The API NetworkPolicy allows ingress only from pods labeled `senseguard.io/client=true` in namespaces labeled `senseguard.io/allow-senseguard=true`. Have the cluster operator apply the namespace label only to approved client namespaces and add the pod-template label to approved client workloads. For example, `kubectl label namespace <client-namespace> senseguard.io/allow-senseguard=true`; setting the pod label belongs in the reviewed client Deployment template. The policy is default-deny for other API callers and requires a CNI that enforces Kubernetes NetworkPolicy.
+
+The OPA client certificate subject must be exactly `CN=senseguard-api`. The OPA server certificate must include `DNS:opa` and `DNS:opa.senseguard.svc`; the API certificate must match the DNS name used by its clients. Keep certificate private keys and token files outside the repository. `kubectl kustomize .` renders locally without contacting a cluster; the GitHub verification workflow performs schema validation, but cluster behavior still needs review against the target Kubernetes version.
 
 The token-map JSON maps consumer IDs to unique random tokens of at least 32 characters. Configure Kubernetes Secret encryption at rest and least-privilege RBAC. These example commands are instructions only and have not been run.
 
-The PVC leaves `storageClassName` unset, so the cluster needs a default dynamic StorageClass. The storage driver must support `fsGroup: 65532`. The app and OPA require externally created TLS Secrets and a consumer-credentials Secret; no secret material is included in this repository. OPA requires a client certificate and validates it against its configured CA. NetworkPolicy restricts OPA ingress to SenseGuard pods, subject to CNI enforcement. The app Service is ClusterIP-only. No ingress is configured.
+The PVC leaves `storageClassName` unset, so the cluster needs a default dynamic StorageClass. The storage driver must support `fsGroup: 65532`. The app and OPA require externally created TLS Secrets and a consumer-credentials Secret; no secret material is included in this repository. OPA requires a client certificate and validates it against its configured CA. NetworkPolicies restrict OPA ingress to SenseGuard and API ingress to client pods labeled `senseguard.io/client=true` in namespaces labeled `senseguard.io/allow-senseguard=true`; enforcement depends on the CNI. Apply those labels only to reviewed client workloads. The app Service is ClusterIP-only. No ingress is configured.
 
 Future commands only — **NOT EXECUTED** (they change a cluster):
 
 ```powershell
 # After the namespace, ConfigMap, and required Secrets above exist:
-kubectl apply -k .\k8s
+kubectl apply -k .
 kubectl -n senseguard rollout status deployment/opa
 kubectl -n senseguard rollout status deployment/senseguard
 kubectl -n senseguard port-forward svc/senseguard 8443:443
