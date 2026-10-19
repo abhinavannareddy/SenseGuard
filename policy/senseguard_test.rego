@@ -79,3 +79,11 @@ test_senseguard_client_cannot_access_opa_admin_api if {
 		"path": ["v1", "policies"],
 	}
 }
+
+test_unknown_client_cannot_access_opa_health if {
+	not data.system.authz.allow with input as {
+		"identity": "CN=other-client",
+		"method": "GET",
+		"path": ["health"],
+	}
+}

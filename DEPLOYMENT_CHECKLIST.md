@@ -1,10 +1,19 @@
 # SenseGuard deployment checklist
 
-This is preparation guidance. No cluster deployment has been performed.
+This is preparation guidance. No cluster deployment has been performed. See `VERIFICATION_REPORT.md` for current-source test results and their limits.
+
+## Current-source verification record (2026-10-19)
+
+- [x] Go 1.24.13 tests, vet, race tests, and coverage (70.3%) passed for `./cmd/senseguard/...`.
+- [x] OPA 1.0.0 policy suite passed (16/16).
+- [x] Compose configuration, Docker image build, and local Kustomize render passed.
+- [x] Isolated runtime checks passed for auth, identity mismatch, denied-request budget behavior, budget exhaustion, readiness, and OPA outage fail-closed behavior.
+- [x] SQLite backup/restore unit test passed using a separate temporary database copy.
+- [ ] Re-run all release checks against the exact committed source and validate cluster-specific items before staging.
 
 ## Before local Compose use
 
-- [ ] Review `VERIFICATION_REPORT.md`; run checks marked NOT RUN where Go, OPA, and Docker are available.
+- [x] Review `VERIFICATION_REPORT.md` and current-source check results above.
 - [ ] Use simulated data only.
 - [ ] Confirm required software/image downloads are allowed.
 - [ ] Run `docker compose config --quiet`.
@@ -28,7 +37,7 @@ This is preparation guidance. No cluster deployment has been performed.
 
 ## Before a restricted staging rollout
 
-- [ ] Run all required Go and OPA tests, vet, race tests, Compose config validation, and Docker image build against the current source.
+- [x] Current-source Go and OPA tests, vet, race tests, Compose config validation, Docker image build, and simulated runtime checks passed; rerun against the exact release commit in CI.
 - [ ] Validate Kubernetes YAML offline and review the manifests against the target cluster version.
 - [ ] Issue API and OPA certificates from the approved CA. Include `DNS:opa` and `DNS:opa.senseguard.svc` on the OPA server certificate; include the service DNS name on the API certificate; set the OPA client certificate subject to exactly `CN=senseguard-api`.
 - [ ] Create `senseguard-tls`, `opa-server-tls`, and `senseguard-to-opa-client` Secrets from protected certificate files. Do not commit key files.

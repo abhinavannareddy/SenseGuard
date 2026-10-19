@@ -4,57 +4,59 @@ Date: 2026-10-19
 
 ## Decision
 
-**A. NOT READY FOR STAGING.** The current OPA client-identity authorization policy and deployment configuration still need their full test/build suite and target-environment validation. Use simulated data only. No deployment was performed.
+**A. NOT READY FOR STAGING.** Current-source checks and an isolated local runtime smoke test pass, but production identity issuance, real certificate provisioning, Kubernetes schema/cluster validation, persistent-volume behavior, and a target-environment recovery exercise are outstanding. Use simulated data only. No staging, production, cloud, or Kubernetes deployment was performed.
 
-## Architecture and security controls
+## Architecture and controls
 
-SenseGuard is a Go HTTP API that authenticates consumers with startup-configured bearer tokens, asks OPA to authorize purpose and privacy mode, transforms simulated sensing data, and charges a per-consumer SQLite ledger before returning the response. The budget endpoint uses the same authenticated identity as sensing; a caller-supplied `X-Consumer-ID` cannot select another account. OPA errors and database errors fail closed.
+SenseGuard is a Go HTTP API that authenticates consumers using startup-configured bearer tokens, asks OPA to authorize purpose and privacy mode, transforms simulated sensing data, and charges a per-consumer SQLite ledger before returning a response. `/budget` uses the same authenticated identity as `/sensing`; `X-Consumer-ID` cannot select another account. OPA and database failures fail closed. The ledger is a single-instance design.
 
-Compose is a localhost-only development profile using HTTP. Its OPA health check evaluates a known policy decision and queries a loopback-only diagnostic endpoint. SenseGuard readiness checks both SQLite and OPA. The Compose services now drop Linux capabilities, use read-only root filesystems and no-new-privileges, and have CPU and memory limits.
+Compose is a localhost-only development profile. API-to-OPA traffic is HTTP on its private Compose network, and the OPA API does not authenticate Compose clients. Its health check evaluates an expected policy decision, confirms the authorization policy is loaded, and checks OPA's loopback diagnostic endpoint. SenseGuard readiness checks SQLite and OPA. Containers use non-root execution, read-only root filesystems, dropped capabilities, no-new-privileges, and resource limits. `.dockerignore` limits the build context to the Dockerfile, Go module files, and application source.
 
-The Kubernetes manifests are preparation only. They require API HTTPS and mTLS to OPA, pin the expected OPA client subject to `CN=senseguard-api`, restrict OPA's API to the decision and health paths, disable service-account token mounting, apply non-root/read-only/capability/seccomp controls, and keep the Service internal. NetworkPolicy behavior depends on the cluster CNI. The SQLite PVC is a single-replica design and is not a backup.
+The Kubernetes manifests are preparation only. They configure API HTTPS and mTLS to OPA; OPA pins the client certificate subject to `CN=senseguard-api` and limits API access to the policy decision and health endpoints. NetworkPolicy enforcement depends on the cluster CNI. The Service is internal, no Ingress is configured, and the SQLite PVC is not a backup.
 
-The README includes request-flow and deployment-topology diagrams plus compressed illustrative images for the privacy modes. The visuals describe demo behavior and make no privacy-guarantee claim.
+The README includes request-flow and deployment-topology diagrams and illustrative privacy-mode images. They describe demo behavior and do not claim a formal privacy guarantee.
 
-## Checks and results
+## Checks on the current source
 
-### Ran against this documentation/configuration pass
+All checks below completed on 2026-10-19. Go and OPA ran from versioned containers because host binaries are not installed. The repository was mounted read-only for Go tests; OPA policy files were mounted read-only.
 
-- **PASS** `docker compose config --quiet` using an ephemeral validation-only token map. No token value was printed or saved.
-- **PASS** `kubectl kustomize .\k8s` rendered the full resource set locally with kubectl client 1.36.1 and Kustomize 5.8.1. This checks Kustomize/YAML parsing; it does not validate Kubernetes schemas or contact a cluster.
-- **PASS** `git diff --check` on the tracked diff and a separate trailing-whitespace check on new Rego/YAML files.
-- **PASS** A targeted scan of 29 source/document text files found no private-key headers, common GitHub/AWS token formats, literal bearer credentials, or cleartext password/API-key assignments. No dedicated secret-scanning tool is installed; binary illustrations and ignored local archives/backups are not part of the candidate changes. `.gitignore` rules for environment files, consumer tokens, certificate/key files, databases, backup folders, and ZIP archives were checked.
-- **PASS** The configured Git author and current commit author are the repository owner; no contributor or repository settings were changed.
+| Check | Result |
+|---|---|
+| `go test ./...` with Go 1.24.13 | PASS, application package and one ignored historical audit copy |
+| `go test ./cmd/senseguard/...` with Go 1.24.13 | PASS |
+| `go vet ./cmd/senseguard/...` with Go 1.24.13 | PASS, no diagnostics |
+| `go test -race ./cmd/senseguard/...` with Go 1.24.13 | PASS |
+| `go test -cover ./cmd/senseguard/...` with Go 1.24.13 | PASS, 70.3% statement coverage |
+| OPA 1.0.0 `opa test policy -v` | PASS, 16/16 tests |
+| `docker compose config --quiet` with a temporary token map | PASS |
+| `docker build -t senseguard:verify-20261019 .` | PASS |
+| `kubectl kustomize .\k8s` | PASS, local render only |
+| Isolated Docker runtime smoke checks | PASS, details below |
 
-### Earlier checks on the current Go implementation
+The isolated runtime used a new temporary network, the newly built image, random throwaway credentials, a localhost-only published port, and a tmpfs database. It did not mount or modify the existing Compose volume or any database. Verified `/healthz` and `/readyz` (200); missing/invalid credentials (401); caller identity mismatch (403); authenticated budget lookup; invalid mode (400); allowed noisy request (200); denied policy request (403) with no budget charge; exhausted budget (429); and readiness plus sensing failure (503) after stopping the test OPA container. The OPA health-check policy itself evaluated successfully. Only the temporary test containers were stopped afterward.
 
-The Go authentication/TLS source was unchanged in this visual/documentation pass. Previous execution results were:
-
-- `go test ./cmd/senseguard/...` passed, including the stopped-database-copy restore test (`ok senseguard/cmd/senseguard 2.245s`).
-- `go vet ./cmd/senseguard/...` and `go test -race ./cmd/senseguard/...` passed before that final test-only backup-copy addition. Coverage was 67.4% before that addition. An earlier pre-authentication revision had 72.3% coverage; that number does not describe the current implementation.
-- OPA policy tests passed 11/11 before four tests were added for OPA API authorization. The current 15-test suite has **not** run.
-- A fresh app runtime check passed earlier for unauthenticated/invalid credentials (401), identity spoofing (403), authorized requests (200), denied requests (403 without budget charge), health/readiness (200), and budget exhaustion (429). This did not include the newly added OPA `system.authz` identity/path restriction.
-- An OPA 1.0.0 runtime check had verified the earlier policy health rule. The new OPA client authorization rules have not been run.
-- `docker compose config --quiet` and `kubectl kustomize .\k8s` passed in this pass. The Docker image build and runtime were not repeated because the Docker Engine named pipe is unavailable. No containers or volumes were changed.
-
-Go and OPA are not installed on PATH in this session. Docker CLI is installed, but the Docker Desktop Linux engine is unavailable. No Kubernetes cluster is connected. `kubectl kustomize` was available and performed the local render described above. Kubernetes schema validation, cluster behavior, certificate trust, CNI enforcement, storage permissions, and PVC persistence remain unverified.
+`kubectl kustomize` parsed and rendered the manifest set, but Kubernetes API schema validation and cluster behavior were not tested. No cluster was contacted. TLS/mTLS handshakes, a real identity provider or token lifecycle, CNI enforcement, storage ownership, image pull from a registry, and real PVC persistence remain unverified.
 
 ## Backup and recovery
 
-The source tests cover copying a closed SQLite database to a separate file and reopening it. No backup or restore was performed against the existing Compose volume or any real deployment. The README now documents a timestamped, non-overwriting offline copy procedure that restarts the service even if copying fails, and requires restoring only to a separate test directory. Recovery objectives and a real restore exercise remain outstanding. Existing databases and Docker volumes were not modified in this pass.
+The Go suite includes a backup/restore test using a separate temporary SQLite database copy and verifies the restored database. This does not validate copying a live or mounted deployment database, backup scheduling, retention, restore objectives, or recovery in a target environment. The README documents an offline, non-overwriting file-copy procedure and restoration to a separate test location. Existing databases and Docker volumes were not used or changed in this verification pass.
 
-## Privacy and deployment blockers
+## Security and privacy limits
 
-Budget units are per-request counters, not epsilon accounting. Noisy mode uses pseudo-random Laplace-shaped noise without a defined sensitivity, neighboring-data model, or accountant. Coarse output retains types/counts, and small aggregates may reveal individuals. No formal differential-privacy claim is supported.
+Consumer identity comes from the bearer token map, not a caller-supplied identity header. TLS configuration rejects OPA HTTP downgrade when OPA TLS files or `REQUIRE_TLS` are configured. Noisy demo mode uses `crypto/rand` and fails closed if random generation fails; the distribution has no approved sensitivity, neighboring-data definition, epsilon/delta accountant, or composition model. Coarse output retains types/counts, and small aggregates may reveal individuals. No formal differential-privacy claim is supported.
 
-Before restricted staging, run the current Go and 15-test OPA suites, vet, race, coverage, Compose validation, and Docker build/runtime checks; validate Kubernetes schemas offline; provision real certificates and consumer credentials through approved secret management; verify Secret encryption/RBAC, TLS subject/SANs, CNI enforcement, storage permissions, image availability, and persistence; and test recovery on a separate database.
+Static bearer tokens still need approved issuance, secure delivery, rotation, revocation, and least-privilege storage. Compose must remain restricted to the local machine and is not suitable for untrusted callers. Production also requires target-cluster threat review, monitoring and retention controls, measured capacity, tested recovery objectives, and independent security/privacy review. Keep one API replica with this SQLite ledger.
 
-Before production, also complete formal privacy accounting and review, backup/recovery objectives, monitoring and retention controls, capacity planning, target-cluster validation, and independent security/privacy review. Keep one SenseGuard replica unless the budget ledger is redesigned for shared transactional storage.
+## Secret and change review
 
-## Repository state
+The targeted scan of the 12 changed text files found no matches for private-key headers, common GitHub/AWS/Google/Slack token formats, JWT-like strings, or literal bearer credentials. No dedicated secret-scanning tool is installed, and pattern scanning cannot establish that a file contains no sensitive information. The staged patch was manually reviewed and `git diff --cached --check` passed. Ignored archives, backups, database files, and audit copies are excluded from the commit and Docker build context. `.gitignore` excludes environment files, tokens, certificates/keys, database files, backup directories, and ZIP archives. `git diff --check` passed for the current worktree.
 
-The current branch is `master`, with the configured GitHub remote `origin` pointing at the requested SenseGuard repository. No collaborators or repository settings were changed. Commits use the locally configured repository-owner identity; use repository history to determine the published commit.
+The release Go command intentionally targets `./cmd/senseguard/...`. The separate `go test ./...` run also discovered and passed one ignored audit-copy package. Three ignored snapshots contain older Go source, but they are not release files and were not modified. Keeping release CI scoped to the maintained package avoids accidentally treating historical snapshots as maintained application code.
+
+## Repository release status
+
+The current branch is `master`; the configured `origin` is the requested GitHub repository. Publishing the verified changes requires a normal fast-forward push and must preserve the existing branch history and repository-owner author identity. Do not force-push or include ignored local artifacts.
 
 ## Files changed in this pass
 
-`.gitignore`, `README.md`, `DEPLOYMENT_CHECKLIST.md`, `SECURITY_PRIVACY_REVIEW.md`, `VERIFICATION_REPORT.md`, `docker-compose.yml`, `k8s/kustomization.yaml`, `k8s/opa-config.yaml`, `k8s/opa-deployment.yaml`, `k8s/senseguard-deployment.yaml`, `policy/opa_authz.rego`, `policy/senseguard_test.rego`, `docs/assets/senseguard-hero.jpg`, and `docs/assets/privacy-modes.jpg`.
+`.dockerignore`, `README.md`, `VERIFICATION_REPORT.md`, `SECURITY_PRIVACY_REVIEW.md`, `DEPLOYMENT_CHECKLIST.md`, `cmd/senseguard/main.go`, `cmd/senseguard/main_test.go`, `docker-compose.yml`, `k8s/opa-config.yaml`, `k8s/opa-deployment.yaml`, `policy/senseguard.rego`, and `policy/senseguard_test.rego`.

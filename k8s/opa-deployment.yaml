@@ -50,6 +50,7 @@ spec:
                 - --fail
                 - --format=raw
                 - --data=/policy/senseguard.rego
+                - --data=/policy/opa_authz.rego
                 - data.senseguard.healthcheck
             initialDelaySeconds: 2
             periodSeconds: 5
@@ -63,6 +64,7 @@ spec:
                 - --fail
                 - --format=raw
                 - --data=/policy/senseguard.rego
+                - --data=/policy/opa_authz.rego
                 - data.senseguard.healthcheck
             initialDelaySeconds: 10
             periodSeconds: 10

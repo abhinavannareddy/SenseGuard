@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -13,7 +14,7 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +22,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -53,8 +53,7 @@ type App struct {
 	cfg                 Config
 	ledger              *BudgetLedger
 	data                []SensingData
-	rng                 *rand.Rand
-	rngMu               sync.Mutex
+	randomFloat         func() (float64, error)
 	client              *http.Client
 	consumerTokenHashes map[[32]byte]string
 }
@@ -74,6 +73,9 @@ func NewApp(cfg Config) (*App, error) {
 	}
 	if strings.TrimSpace(cfg.DatabasePath) == "" {
 		cfg.DatabasePath = filepath.Join("data", "senseguard.db")
+	}
+	if err := validateOPAConfig(cfg); err != nil {
+		return nil, err
 	}
 	ledger, err := OpenBudgetLedger(cfg.DatabasePath, cfg.DefaultBudget)
 	if err != nil {
@@ -134,7 +136,7 @@ func NewApp(cfg Config) (*App, error) {
 			{ObjectID: "person-202", X: 30.2, Y: 35.8, Type: "person"},
 			{ObjectID: "vehicle-103", X: 31.5, Y: 36.1, Type: "vehicle"},
 		},
-		rng:                 rand.New(rand.NewSource(time.Now().UnixNano())),
+		randomFloat:         secureUniform53,
 		client:              client,
 		consumerTokenHashes: tokenHashes,
 	}, nil
@@ -232,9 +234,28 @@ func validateOPAURL(raw string, requireTLS bool) error {
 		return errors.New("OPA_URL must use HTTP or HTTPS")
 	}
 	if requireTLS && parsed.Scheme != "https" {
-		return errors.New("OPA_URL must use HTTPS when REQUIRE_TLS is true")
+		return errors.New("OPA_URL must use HTTPS when OPA TLS is configured or REQUIRE_TLS is true")
 	}
 	return nil
+}
+
+func validateOPAConfig(cfg Config) error {
+	clientCertConfigured := cfg.OPAClientCertFile != ""
+	clientKeyConfigured := cfg.OPAClientKeyFile != ""
+	if clientCertConfigured != clientKeyConfigured {
+		return errors.New("OPA client certificate and key must both be configured")
+	}
+	tlsMaterialConfigured := cfg.OPACertFile != "" || clientCertConfigured || clientKeyConfigured
+	if tlsMaterialConfigured && cfg.OPACertFile == "" {
+		return errors.New("OPA_CA_FILE is required when OPA TLS credentials are configured")
+	}
+	if cfg.RequireTLS && (!tlsMaterialConfigured || !clientCertConfigured) {
+		return errors.New("REQUIRE_TLS requires the OPA CA certificate and client certificate and key")
+	}
+	if cfg.OPAURL == "" && !cfg.RequireTLS && !tlsMaterialConfigured {
+		return nil
+	}
+	return validateOPAURL(cfg.OPAURL, cfg.RequireTLS || tlsMaterialConfigured)
 }
 
 func parseConsumerTokens(raw string) (map[string]string, error) {
@@ -345,8 +366,20 @@ func (a *App) sensingHandler(w http.ResponseWriter, r *http.Request) {
 			d.Y = math.Round(d.Y/a.cfg.GridSize) * a.cfg.GridSize
 			d.ObjectID = "object-redacted"
 		case "noisy":
-			d.X += a.laplace(a.cfg.NoiseScale)
-			d.Y += a.laplace(a.cfg.NoiseScale)
+			xNoise, err := a.laplace(a.cfg.NoiseScale)
+			if err != nil {
+				log.Printf("event=noise_generation_error consumer=%q", consumer)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "privacy transform unavailable"})
+				return
+			}
+			yNoise, err := a.laplace(a.cfg.NoiseScale)
+			if err != nil {
+				log.Printf("event=noise_generation_error consumer=%q", consumer)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "privacy transform unavailable"})
+				return
+			}
+			d.X += xNoise
+			d.Y += yNoise
 			d.ObjectID = "object-redacted"
 		case "aggregate":
 			// Aggregate output is handled below; do not return individual records.
@@ -486,21 +519,37 @@ func (a *App) authorize(consumer, purpose, mode string) (bool, error) {
 	return *result.Result, nil
 }
 
-func (a *App) laplace(scale float64) float64 {
+func (a *App) laplace(scale float64) (float64, error) {
 	if !finitePositive(scale) || scale > 1e6 {
-		return 0
+		return 0, errors.New("noise scale must be finite and positive")
 	}
-	a.rngMu.Lock()
-	u := a.rng.Float64() - 0.5
-	a.rngMu.Unlock()
-	if u == 0 {
-		return 0
+	if a.randomFloat == nil {
+		return 0, errors.New("secure random source is unavailable")
 	}
-	// Float64 can return zero, which maps to an endpoint and an infinite log.
-	if math.Abs(u) >= 0.5 {
-		u = math.Copysign(math.Nextafter(0.5, 0), u)
+	u, err := a.randomFloat()
+	if err != nil {
+		return 0, errors.New("secure random source failed")
 	}
-	return -scale * math.Copysign(1, u) * math.Log(1-2*math.Abs(u))
+	if !(u > 0 && u < 1) {
+		return 0, errors.New("secure random source returned an invalid value")
+	}
+	centered := u - 0.5
+	noise := -scale * math.Copysign(1, centered) * math.Log1p(-2*math.Abs(centered))
+	if math.IsNaN(noise) || math.IsInf(noise, 0) {
+		return 0, errors.New("generated noise is invalid")
+	}
+	return noise, nil
+}
+
+func secureUniform53() (float64, error) {
+	// Draw from an interior 53-bit uniform interval so the inverse transform
+	// never evaluates log(0). crypto/rand.Int samples without modulo bias.
+	const denominator = uint64(1) << 53
+	n, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetUint64(denominator-1))
+	if err != nil {
+		return 0, err
+	}
+	return (float64(n.Uint64()) + 1) / float64(denominator), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -574,16 +623,8 @@ func main() {
 	if cfg.OPAURL == "" {
 		cfg.OPAURL = "http://localhost:8181"
 	}
-	if err := validateOPAURL(cfg.OPAURL, requireTLS); err != nil {
+	if err := validateOPAConfig(cfg); err != nil {
 		log.Printf("SenseGuard startup failed: %v", err)
-		os.Exit(1)
-	}
-	if requireTLS && cfg.OPACertFile == "" {
-		log.Printf("SenseGuard startup failed: OPA_CA_FILE is required when REQUIRE_TLS is true")
-		os.Exit(1)
-	}
-	if requireTLS && ((cfg.OPAClientCertFile == "") != (cfg.OPAClientKeyFile == "") || cfg.OPAClientCertFile == "") {
-		log.Printf("SenseGuard startup failed: OPA client certificate and key are required when REQUIRE_TLS is true")
 		os.Exit(1)
 	}
 	if err := validateTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.RequireTLS); err != nil {

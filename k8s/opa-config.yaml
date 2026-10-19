@@ -22,6 +22,11 @@ data:
       response := http.send({"url": "http://127.0.0.1:8282/health", "method": "get", "timeout": "1s"})
       response.status_code == 200
       allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "coarse"}
+      data.system.authz.allow with input as {
+        "identity": "CN=senseguard-api",
+        "method": "POST",
+        "path": ["v1", "data", "senseguard", "allow"],
+      }
     }
   opa_authz.rego: |
     package system.authz

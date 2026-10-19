@@ -28,4 +28,9 @@ healthcheck if {
 	})
 	response.status_code == 200
 	allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "coarse"}
+	data.system.authz.allow with input as {
+		"identity": "CN=senseguard-api",
+		"method": "POST",
+		"path": ["v1", "data", "senseguard", "allow"],
+	}
 }

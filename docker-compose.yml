@@ -20,7 +20,7 @@ services:
     mem_limit: 512m
     cpus: 0.50
     healthcheck:
-      test: ["CMD", "/opa", "eval", "--fail", "--format", "raw", "--data=/policy/senseguard.rego", "data.senseguard.healthcheck"]
+      test: ["CMD", "/opa", "eval", "--fail", "--format", "raw", "--data=/policy/senseguard.rego", "--data=/policy/opa_authz.rego", "data.senseguard.healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5

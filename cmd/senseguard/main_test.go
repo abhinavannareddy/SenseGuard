@@ -4,9 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -246,6 +246,50 @@ func TestOPAURLValidation(t *testing.T) {
 	}
 }
 
+func TestOPAConfigRequiresHTTPSWhenTLSMaterialIsConfigured(t *testing.T) {
+	validTLS := Config{
+		OPAURL:            "https://opa:8181",
+		RequireTLS:        true,
+		OPACertFile:       "ca.pem",
+		OPAClientCertFile: "client.crt",
+		OPAClientKeyFile:  "client.key",
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{name: "plain local HTTP", cfg: Config{OPAURL: "http://opa:8181"}},
+		{name: "TLS CA with HTTP", cfg: Config{OPAURL: "http://opa:8181", OPACertFile: "ca.pem"}, want: true},
+		{name: "server-auth TLS", cfg: Config{OPAURL: "https://opa:8181", OPACertFile: "ca.pem"}},
+		{name: "mTLS", cfg: validTLS},
+		{name: "required TLS without client certificate", cfg: Config{OPAURL: "https://opa:8181", RequireTLS: true, OPACertFile: "ca.pem"}, want: true},
+		{name: "client certificate without CA", cfg: Config{OPAURL: "https://opa:8181", OPAClientCertFile: "client.crt", OPAClientKeyFile: "client.key"}, want: true},
+		{name: "incomplete client pair", cfg: Config{OPAURL: "https://opa:8181", OPACertFile: "ca.pem", OPAClientCertFile: "client.crt"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateOPAConfig(tc.cfg); (err != nil) != tc.want {
+				t.Fatalf("validateOPAConfig() error=%v, wantErr=%t", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestOPAConfigurationFailureDoesNotCreateDatabaseDirectory(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "must-not-be-created")
+	_, err := NewApp(Config{
+		DatabasePath: parent + string(os.PathSeparator) + "senseguard.db",
+		OPAURL:       "http://opa:8181",
+		OPACertFile:  "ca.pem",
+	})
+	if err == nil {
+		t.Fatal("expected HTTP downgrade configuration to be rejected")
+	}
+	if _, statErr := os.Stat(parent); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid OPA TLS configuration created a database directory: stat error=%v", statErr)
+	}
+}
+
 func TestDuplicateAuthorizationHeadersAreRejected(t *testing.T) {
 	app, _ := testApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/budget", nil)
@@ -363,16 +407,41 @@ func TestEnvironmentNumberParserRejectsNonFiniteAndNonPositiveValues(t *testing.
 	}
 }
 
-type zeroRandomSource struct{}
-
-func (zeroRandomSource) Int63() int64 { return 0 }
-func (zeroRandomSource) Seed(int64)   {}
-
-func TestLaplaceNoiseRemainsFiniteAtRandomEndpoint(t *testing.T) {
+func TestLaplaceNoiseRemainsFiniteWithSecureRandomSource(t *testing.T) {
 	app := newTestApplication(t, Config{})
-	app.rng = rand.New(zeroRandomSource{})
-	if got := app.laplace(1); math.IsNaN(got) || math.IsInf(got, 0) {
-		t.Fatalf("noise is not finite: %v", got)
+	for i := 0; i < 100; i++ {
+		got, err := app.laplace(1)
+		if err != nil || math.IsNaN(got) || math.IsInf(got, 0) {
+			t.Fatalf("noise sample is invalid: value=%v err=%v", got, err)
+		}
+	}
+}
+
+func TestLaplaceRejectsUniformEndpointsAndNonFiniteValues(t *testing.T) {
+	app := newTestApplication(t, Config{})
+	for _, value := range []float64{0, 1, math.NaN(), math.Inf(1)} {
+		app.randomFloat = func() (float64, error) { return value, nil }
+		if _, err := app.laplace(1); err == nil {
+			t.Errorf("accepted invalid uniform value %v", value)
+		}
+	}
+}
+
+func TestNoiseGenerationFailureFailsClosedWithoutSpendingBudget(t *testing.T) {
+	app, _ := testApp(t)
+	app.randomFloat = func() (float64, error) { return 0, errors.New("random source unavailable") }
+	req := httptest.NewRequest(http.MethodGet, "/sensing?purpose=crowd-analysis&mode=noisy", nil)
+	req.Header.Set("Authorization", "Bearer "+testResearcherToken)
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("noise failure: want 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"data"`) {
+		t.Fatalf("noise failure returned sensing data: %s", rec.Body.String())
+	}
+	if got, _, err := app.ledger.Snapshot("researcher"); err != nil || got != 2 {
+		t.Fatalf("noise failure spent budget: remaining=%v err=%v", got, err)
 	}
 }
 

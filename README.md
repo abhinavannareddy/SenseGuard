@@ -82,7 +82,7 @@ Go handles HTTP, transformations, and the ledger. OPA evaluates `policy/sensegua
   <img src="docs/assets/privacy-modes.jpg" alt="Three illustrative panels: sensing locations rounded to grid cells, randomized point clouds, and aggregate count bars" width="100%" />
 </p>
 
-Coarse mode rounds coordinates and redacts IDs; noisy mode adds demonstration noise; aggregate mode returns type counts. These are teaching examples, not a differential-privacy guarantee.
+Coarse mode rounds coordinates and redacts IDs; noisy mode adds cryptographically randomized demonstration noise; aggregate mode returns type counts. These are teaching examples, not a differential-privacy guarantee.
 
 ## Configuration
 
@@ -100,14 +100,14 @@ Coarse mode rounds coordinates and redacts IDs; noisy mode adds demonstration no
 | `OPA_CA_FILE` | unset locally / Secret mount in Kubernetes | Trusted OPA server CA |
 | `OPA_CLIENT_CERT_FILE`, `OPA_CLIENT_KEY_FILE` | unset locally / Secret mount in Kubernetes | Client certificate for OPA mutual TLS |
 
-Invalid or non-positive numeric environment values use defaults. `REQUIRE_TLS` accepts only `true` or `false`; any other value stops startup. When TLS is enabled, OPA must use HTTPS and its server certificate must chain to the CA configured by `OPA_CA_FILE`. The service exits at startup if `CONSUMER_TOKENS` is missing or malformed. Tokens must be unique and at least 32 characters; generate them with a cryptographically secure random generator and distribute each token only to its consumer. The Kubernetes OPA policy also pins the mTLS client subject to `CN=senseguard-api` and permits only the allow-decision and health endpoints.
+Invalid or non-positive numeric environment values use defaults. `REQUIRE_TLS` accepts only `true` or `false`; any other value stops startup. When `REQUIRE_TLS=true`, the API requires TLS certificate/key files and OPA requires HTTPS, a trusted CA, and a client certificate/key. If any OPA TLS file is configured, `OPA_URL` must use HTTPS; partial client-certificate pairs are rejected at startup. The service exits at startup if `CONSUMER_TOKENS` is missing or malformed. Tokens must be unique and at least 32 characters; generate them with a cryptographically secure random generator and distribute each token only to its consumer. The Kubernetes OPA policy also pins the mTLS client subject to `CN=senseguard-api` and permits only the allow-decision and health endpoints.
 
 ## Run directly with Go
 
 This needs Go installed and OPA running. In a first PowerShell window, start OPA (the first run may download its official image):
 
 ```powershell
-docker run --rm -p 127.0.0.1:8181:8181 --mount "type=bind,source=$($PWD.Path)\policy,target=/policy,readonly" openpolicyagent/opa:1.0.0 run --server --addr=0.0.0.0:8181 --diagnostic-addr=127.0.0.1:8282 /policy/senseguard.rego
+docker run --rm -p 127.0.0.1:8181:8181 --mount "type=bind,source=$($PWD.Path)\policy,target=/policy,readonly" openpolicyagent/opa:1.0.0 run --server --addr=0.0.0.0:8181 --diagnostic-addr=127.0.0.1:8282 /policy/senseguard.rego /policy/opa_authz.rego
 ```
 
 In a second window, from the project directory:
@@ -155,7 +155,7 @@ opa test policy/ -v
 docker compose config --quiet
 ```
 
-Go checks target the application package so ignored audit snapshots in the workspace are not included. Go tests use a mocked OPA server; `opa test` checks the actual Rego files. Compose config validation does not start services. If using Docker for Go/OPA checks, official images may be downloaded when missing. Ask before pulling images. Read-only mount examples:
+The release Go commands target `./cmd/senseguard/...` so they test the maintained application package only. A root-level `go test ./...` can also discover ignored historical audit copies; that broader command passed during the 2026-10-19 verification, but snapshots are not release source. Go tests use a mocked OPA server; `opa test` checks the actual Rego files. Compose config validation does not start services. If using Docker for Go/OPA checks, official images may be downloaded when missing. Read-only mount examples:
 
 ```powershell
 docker run --rm --mount "type=bind,source=$($PWD.Path),target=/workspace,readonly" --workdir /workspace golang:1.24.13-alpine go test ./cmd/senseguard/...
@@ -182,7 +182,7 @@ docker compose up --build
 
 This builds the API image, may download Go, Distroless, and OPA images, and starts both services. Both published ports bind to localhost. Stop with Ctrl+C, or use `docker compose stop` / `docker compose down` without `-v`.
 
-Compose waits for an OPA health check that evaluates a known allowed policy decision and calls OPA's loopback-only diagnostic `/health` endpoint. Its OPA API uses plain HTTP inside the Compose network, so this is a localhost-only development profile. SenseGuard `/readyz` separately checks SQLite and OPA `/health`; authorization errors fail closed. The Kubernetes profile uses HTTPS for the API and mutual TLS plus OPA API authorization for SenseGuard-to-OPA traffic. OPA permits the pinned `CN=senseguard-api` identity to query only the policy decision and health endpoint.
+Compose waits for an OPA health check that evaluates a known allowed decision, confirms the API authorization policy is loaded, and calls OPA's loopback-only diagnostic `/health` endpoint. The Compose OPA API uses plain HTTP inside the local network and does not authenticate API clients; this is a localhost-only development profile. SenseGuard `/readyz` separately checks SQLite and OPA `/health`; authorization errors fail closed. The Kubernetes profile configures HTTPS for the API and mutual TLS plus OPA API authorization for SenseGuard-to-OPA traffic. OPA permits the pinned `CN=senseguard-api` identity to query only the policy decision and health endpoint.
 
 Health and readiness:
 
@@ -255,7 +255,24 @@ try {
 }
 ```
 
-Keep the backup protected and out of source control. Restore only to a new, separate test directory; never copy a backup over the live volume. Check the restored copy with `sqlite3 "<path-to-restored-file>" "PRAGMA integrity_check;"` and confirm it prints `ok`. Backup/restore against the running Compose volume has not been validated in this engineering pass.
+Keep the backup protected and out of source control. Restore only to a new, separate test directory; never copy a backup over the live volume. Example using a backup path you have recorded:
+
+```powershell
+$backupFile = 'C:\secure-backups\senseguard.db'
+$restoreDir = Join-Path $env:TEMP ('senseguard-restore-test-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff'))
+if (Test-Path -LiteralPath $restoreDir) { throw 'Restore test path already exists; refusing to overwrite it.' }
+New-Item -ItemType Directory -Path $restoreDir | Out-Null
+$restoredFile = Join-Path $restoreDir 'senseguard.db'
+Copy-Item -LiteralPath $backupFile -Destination $restoredFile -ErrorAction Stop
+if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
+    $integrity = & sqlite3 $restoredFile 'PRAGMA integrity_check;'
+    if ($LASTEXITCODE -ne 0 -or $integrity -ne 'ok') { throw 'Restored database integrity check failed.' }
+} else {
+    Write-Warning 'sqlite3 is not installed; verify this copy with the application restore test or an approved SQLite tool.'
+}
+```
+
+Backup/restore against the running Compose volume has not been validated in this engineering pass. The Go test verifies a stopped database copy can be opened separately and that a known balance survives; it is not a production recovery drill.
 
 ## Logs and troubleshooting
 
@@ -311,7 +328,7 @@ See `DEPLOYMENT_CHECKLIST.md` first. No Kubernetes deployment was performed.
 - SQLite transactions/mutex protect this single replica; they do not provide a shared budget across multiple app replicas.
 - Budget units are per-request counters, not epsilon accounting.
 - Coarse mode rounds coordinates and redacts IDs, but keeps object types and counts.
-- Noisy mode adds pseudo-random Laplace-shaped noise, but no sensitivity, neighboring-data model, or privacy accountant is defined. Noise alone is not differential privacy.
+- Noisy mode samples Laplace-shaped demonstration noise with Go's cryptographically secure random source and fails closed if random generation fails. No sensitivity, neighboring-data model, or privacy accountant is defined, so this is not differential privacy.
 - Aggregate counts can expose information about small groups.
 - Use simulated data only. Formal privacy accounting, tested restore, cluster storage validation, monitoring, retention/log policies, and specialist security/privacy review remain required before production.
 
