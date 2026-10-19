@@ -13,6 +13,7 @@ spec:
       labels:
         app: opa
     spec:
+      automountServiceAccountToken: false
       securityContext:
         fsGroup: 1000
         seccompProfile:
@@ -20,7 +21,18 @@ spec:
       containers:
         - name: opa
           image: openpolicyagent/opa:1.0.0
-          args: ["run", "--server", "--addr=https://0.0.0.0:8181", "--diagnostic-addr=127.0.0.1:8282", "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key", "--tls-ca-cert-file=/tls/ca.crt", "--authentication=tls", "/policy/senseguard.rego"]
+          args:
+            - run
+            - --server
+            - --addr=https://0.0.0.0:8181
+            - --diagnostic-addr=127.0.0.1:8282
+            - --tls-cert-file=/tls/tls.crt
+            - --tls-private-key-file=/tls/tls.key
+            - --tls-ca-cert-file=/tls/ca.crt
+            - --authentication=tls
+            - --authorization=basic
+            - /policy/senseguard.rego
+            - /policy/opa_authz.rego
           ports:
             - containerPort: 8181
           resources:

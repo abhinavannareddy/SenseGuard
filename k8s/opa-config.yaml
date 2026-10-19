@@ -23,3 +23,17 @@ data:
       response.status_code == 200
       allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": "coarse"}
     }
+  opa_authz.rego: |
+    package system.authz
+    import rego.v1
+    default allow := false
+    allow if {
+      input.identity == "CN=senseguard-api"
+      input.method == "POST"
+      input.path == ["v1", "data", "senseguard", "allow"]
+    }
+    allow if {
+      input.identity == "CN=senseguard-api"
+      input.method == "GET"
+      input.path == ["health"]
+    }

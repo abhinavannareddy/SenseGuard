@@ -1,14 +1,24 @@
 services:
   opa:
     image: openpolicyagent/opa:1.0.0
-    command: ["run", "--server", "--addr=0.0.0.0:8181", "--diagnostic-addr=127.0.0.1:8282", "/policy/senseguard.rego"]
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --diagnostic-addr=127.0.0.1:8282
+      - /policy/senseguard.rego
+      - /policy/opa_authz.rego
     volumes:
       - ./policy:/policy:ro
     ports:
       - "127.0.0.1:8181:8181"
     read_only: true
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.50
     healthcheck:
       test: ["CMD", "/opa", "eval", "--fail", "--format", "raw", "--data=/policy/senseguard.rego", "data.senseguard.healthcheck"]
       interval: 10s
@@ -35,8 +45,12 @@ services:
       opa:
         condition: service_healthy
     read_only: true
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.50
 
 volumes:
   senseguard-data:

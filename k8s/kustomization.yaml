@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - opa-config.yaml
+  - opa-deployment.yaml
+  - senseguard-pvc.yaml
+  - senseguard-deployment.yaml

@@ -47,3 +47,35 @@ test_invalid_input_types_are_denied if {
 	not allow with input as {"consumer": "researcher", "purpose": 123, "mode": "coarse"}
 	not allow with input as {"consumer": "researcher", "purpose": "crowd-analysis", "mode": 123}
 }
+
+test_senseguard_client_can_query_only_the_allow_decision if {
+	data.system.authz.allow with input as {
+		"identity": "CN=senseguard-api",
+		"method": "POST",
+		"path": ["v1", "data", "senseguard", "allow"],
+	}
+}
+
+test_senseguard_client_can_check_opa_health if {
+	data.system.authz.allow with input as {
+		"identity": "CN=senseguard-api",
+		"method": "GET",
+		"path": ["health"],
+	}
+}
+
+test_unknown_client_cannot_query_opa if {
+	not data.system.authz.allow with input as {
+		"identity": "CN=other-client",
+		"method": "POST",
+		"path": ["v1", "data", "senseguard", "allow"],
+	}
+}
+
+test_senseguard_client_cannot_access_opa_admin_api if {
+	not data.system.authz.allow with input as {
+		"identity": "CN=senseguard-api",
+		"method": "GET",
+		"path": ["v1", "policies"],
+	}
+}

@@ -1,18 +1,88 @@
-# SenseGuard
+<p align="center">
+  <img src="docs/assets/senseguard-hero.jpg" alt="A stream of sensing signals passing through a luminous privacy shield and emerging as simplified data" width="100%" />
+</p>
 
-SenseGuard is a learning project for privacy-aware release of **simulated** 6G sensing data. Its Go API checks authorization with Open Policy Agent (OPA), applies a privacy mode, then charges a per-consumer budget in SQLite.
+<h1 align="center">SenseGuard</h1>
+<p align="center"><strong>Privacy-aware release for simulated 6G sensing data</strong><br />Policy-gated · Identity-bound · Budget-accounted</p>
 
-This is a prototype. It is not production-ready and does not provide formal differential privacy.
+<p align="center"><a href="SECURITY_PRIVACY_REVIEW.md">Security review</a> · <a href="VERIFICATION_REPORT.md">Verification report</a> · <a href="DEPLOYMENT_CHECKLIST.md">Deployment checklist</a></p>
 
-## How a request works
+<p align="center">
+  <img alt="Go 1.24.13" src="https://img.shields.io/badge/Go-1.24.13-00ADD8?logo=go&logoColor=white" />
+  <img alt="OPA 1.0.0" src="https://img.shields.io/badge/Policy-OPA%201.0.0-7C4DFF" />
+  <img alt="SQLite" src="https://img.shields.io/badge/Ledger-SQLite-0F80CC?logo=sqlite&logoColor=white" />
+  <img alt="Prototype" src="https://img.shields.io/badge/Status-Prototype-64748B" />
+</p>
 
-1. A client sends a bearer token over HTTPS to SenseGuard on port 8080 (Kubernetes profile). The localhost-only Compose profile uses HTTP for development.
-2. SenseGuard derives consumer identity from the verified bearer token, then validates the purpose and mode. A caller-supplied `X-Consumer-ID` cannot establish identity and is rejected if it conflicts with the token.
-3. It asks OPA on port 8181 whether the request is allowed. OPA errors, timeouts, non-200 responses, or malformed replies fail closed.
-4. For an allowed request, SenseGuard prepares coarse, noisy, or aggregate output.
-5. A SQLite transaction deducts the configured cost. Protected data is returned only after the transaction is confirmed.
+SenseGuard is a small Go API that authenticates consumers, asks Open Policy Agent (OPA) to evaluate each purpose and privacy mode, transforms simulated sensing data, then charges a per-consumer SQLite budget before returning it.
 
-Go handles HTTP, transformations, and the ledger. OPA evaluates `policy/senseguard.rego`. Docker Compose runs both locally. Kubernetes files describe a cluster setup but do not deploy it.
+> **Prototype:** simulated data only. SenseGuard is not production-ready and does not provide formal differential privacy.
+
+## Request architecture
+
+```mermaid
+flowchart LR
+    client["Client<br/>Bearer token"] -->|"HTTPS in Kubernetes<br/>HTTP on localhost in Compose"| api["SenseGuard API<br/>Authenticate · validate"]
+    api -->|"Consumer · purpose · mode"| opa["OPA<br/>Allow-list policy"]
+    opa -->|"Allow / deny decision"| api
+    api -->|"Allowed"| transform["Privacy transform<br/>Coarse · noisy · aggregate"]
+    api -->|"Denied"| denied["403<br/>No budget charge"]
+    api -->|"OPA unavailable / invalid"| failure["503<br/>No sensing data"]
+    transform -->|"Prepared response"| ledger[("SQLite budget ledger<br/>Atomic charge")]
+    api -->|"/budget lookup"| ledger
+    ledger -->|"Commit confirmed"| result["Protected response"]
+    ledger -->|"Budget exhausted"| exhausted["429<br/>No sensing data"]
+    ledger -->|"DB error / full ledger"| failure
+    result --> client
+
+    classDef service fill:#0B1F35,stroke:#22D3EE,color:#EAFBFF,stroke-width:1.5px
+    classDef store fill:#102B24,stroke:#34D399,color:#ECFDF5,stroke-width:1.5px
+    classDef reject fill:#351923,stroke:#FB7185,color:#FFF1F2,stroke-width:1.5px
+    class api,opa,transform service
+    class ledger store
+    class denied,failure reject
+```
+
+Authorization happens before any charge. The API returns sensing data only after SQLite confirms the budget transaction.
+
+## Deployment profiles
+
+```mermaid
+flowchart TB
+    subgraph local["Local demo · Docker Compose"]
+        composeClient["Client"] -->|"HTTP · loopback only"| composeAPI["SenseGuard :8080"]
+        composeAPI -->|"HTTP :8181"| composeOPA["OPA policy service"]
+        composeOPA -->|"Decision"| composeAPI
+        composeAPI --> composeDB[("Named volume<br/>SQLite ledger")]
+    end
+
+    subgraph cluster["Kubernetes preparation · not deployed"]
+        clusterClient["In-cluster client"] -->|"HTTPS :443"| clusterAPI["SenseGuard · one replica"]
+        clusterAPI -->|"mTLS :8181"| clusterOPA["Internal OPA service"]
+        clusterOPA -->|"Decision"| clusterAPI
+        clusterAPI --> clusterDB[("1 GiB PVC<br/>SQLite ledger")]
+        policyNet["NetworkPolicy<br/>SenseGuard → OPA"] -. restricts .-> clusterOPA
+    end
+
+    classDef app fill:#0B1F35,stroke:#22D3EE,color:#EAFBFF
+    classDef control fill:#21153B,stroke:#A78BFA,color:#F5F3FF
+    classDef store fill:#102B24,stroke:#34D399,color:#ECFDF5
+    classDef net fill:#172554,stroke:#60A5FA,color:#EFF6FF
+    class composeAPI,clusterAPI app
+    class composeOPA,clusterOPA control
+    class composeDB,clusterDB store
+    class policyNet net
+```
+
+Go handles HTTP, transformations, and the ledger. OPA evaluates `policy/senseguard.rego`. Compose is a localhost-only development profile; Kubernetes manifests are preparation only. SQLite is a single-replica ledger, not a shared multi-replica store.
+
+## Privacy modes at a glance
+
+<p align="center">
+  <img src="docs/assets/privacy-modes.jpg" alt="Three illustrative panels: sensing locations rounded to grid cells, randomized point clouds, and aggregate count bars" width="100%" />
+</p>
+
+Coarse mode rounds coordinates and redacts IDs; noisy mode adds demonstration noise; aggregate mode returns type counts. These are teaching examples, not a differential-privacy guarantee.
 
 ## Configuration
 
@@ -30,14 +100,14 @@ Go handles HTTP, transformations, and the ledger. OPA evaluates `policy/sensegua
 | `OPA_CA_FILE` | unset locally / Secret mount in Kubernetes | Trusted OPA server CA |
 | `OPA_CLIENT_CERT_FILE`, `OPA_CLIENT_KEY_FILE` | unset locally / Secret mount in Kubernetes | Client certificate for OPA mutual TLS |
 
-Invalid or non-positive numeric environment values use defaults. `REQUIRE_TLS` accepts only `true` or `false`; any other value stops startup. When TLS is enabled, OPA must use HTTPS and its server certificate must chain to the CA configured by `OPA_CA_FILE`. The service exits at startup if `CONSUMER_TOKENS` is missing or malformed. Tokens must be unique and at least 32 characters; generate them with a cryptographically secure random generator and distribute each token only to its consumer.
+Invalid or non-positive numeric environment values use defaults. `REQUIRE_TLS` accepts only `true` or `false`; any other value stops startup. When TLS is enabled, OPA must use HTTPS and its server certificate must chain to the CA configured by `OPA_CA_FILE`. The service exits at startup if `CONSUMER_TOKENS` is missing or malformed. Tokens must be unique and at least 32 characters; generate them with a cryptographically secure random generator and distribute each token only to its consumer. The Kubernetes OPA policy also pins the mTLS client subject to `CN=senseguard-api` and permits only the allow-decision and health endpoints.
 
 ## Run directly with Go
 
 This needs Go installed and OPA running. In a first PowerShell window, start OPA (the first run may download its official image):
 
 ```powershell
-docker run --rm -p 127.0.0.1:8181:8181 --mount "type=bind,source=$($PWD.Path)\policy,target=/policy,readonly" openpolicyagent/opa:1.0.0 run --server --addr=0.0.0.0:8181 /policy/senseguard.rego
+docker run --rm -p 127.0.0.1:8181:8181 --mount "type=bind,source=$($PWD.Path)\policy,target=/policy,readonly" openpolicyagent/opa:1.0.0 run --server --addr=0.0.0.0:8181 --diagnostic-addr=127.0.0.1:8282 /policy/senseguard.rego
 ```
 
 In a second window, from the project directory:
@@ -46,8 +116,15 @@ In a second window, from the project directory:
 $env:OPA_URL = 'http://localhost:8181'
 # Set CONSUMER_TOKENS to a JSON map from consumer ID to a unique random token.
 # Keep this process environment private; never commit the value.
-$env:RESEARCHER_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-$env:CONSUMER_TOKENS = @{ researcher = $env:RESEARCHER_TOKEN } | ConvertTo-Json -Compress
+function New-ConsumerToken {
+    $bytes = New-Object byte[] 32
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes); [Convert]::ToBase64String($bytes) }
+    finally { $generator.Dispose() }
+}
+$env:RESEARCHER_TOKEN = New-ConsumerToken
+$env:MALL_MANAGER_TOKEN = New-ConsumerToken
+$env:CONSUMER_TOKENS = @{ researcher = $env:RESEARCHER_TOKEN; 'mall-manager' = $env:MALL_MANAGER_TOKEN } | ConvertTo-Json -Compress
 $env:DATABASE_PATH = Join-Path $PWD.Path 'data\senseguard.db'
 go run ./cmd/senseguard
 ```
@@ -91,14 +168,21 @@ These need a working Docker engine and available images. Check `VERIFICATION_REP
 ## Start with Docker Compose
 
 ```powershell
-$env:RESEARCHER_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-$env:CONSUMER_TOKENS = @{ researcher = $env:RESEARCHER_TOKEN } | ConvertTo-Json -Compress
+function New-ConsumerToken {
+    $bytes = New-Object byte[] 32
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes); [Convert]::ToBase64String($bytes) }
+    finally { $generator.Dispose() }
+}
+$env:RESEARCHER_TOKEN = New-ConsumerToken
+$env:MALL_MANAGER_TOKEN = New-ConsumerToken
+$env:CONSUMER_TOKENS = @{ researcher = $env:RESEARCHER_TOKEN; 'mall-manager' = $env:MALL_MANAGER_TOKEN } | ConvertTo-Json -Compress
 docker compose up --build
 ```
 
 This builds the API image, may download Go, Distroless, and OPA images, and starts both services. Both published ports bind to localhost. Stop with Ctrl+C, or use `docker compose stop` / `docker compose down` without `-v`.
 
-Compose waits for an OPA health check that calls OPA HTTP `/health` and evaluates a known allowed decision against the mounted policy. SenseGuard `/readyz` separately checks SQLite and OPA `/health`; authorization errors fail closed. The Kubernetes profile uses HTTPS for the API and mutual TLS for OPA.
+Compose waits for an OPA health check that evaluates a known allowed policy decision and calls OPA's loopback-only diagnostic `/health` endpoint. Its OPA API uses plain HTTP inside the Compose network, so this is a localhost-only development profile. SenseGuard `/readyz` separately checks SQLite and OPA `/health`; authorization errors fail closed. The Kubernetes profile uses HTTPS for the API and mutual TLS plus OPA API authorization for SenseGuard-to-OPA traffic. OPA permits the pinned `CN=senseguard-api` identity to query only the policy decision and health endpoint.
 
 Health and readiness:
 
@@ -156,11 +240,22 @@ Stop the API to avoid writes, copy its DB file, then start it again. This is an 
 
 ```powershell
 docker compose stop senseguard
-docker compose cp senseguard:/data/senseguard.db .\senseguard.db.backup
-docker compose start senseguard
+try {
+    if ($LASTEXITCODE -ne 0) { throw 'Could not stop SenseGuard; check the Compose service.' }
+    $backupDir = Join-Path $PWD.Path ('backups\senseguard-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fffffff'))
+    if (Test-Path -LiteralPath $backupDir) { throw 'Backup path already exists; choose a new path.' }
+    New-Item -ItemType Directory -Path $backupDir | Out-Null
+    $backupFile = Join-Path $backupDir 'senseguard.db'
+    if (Test-Path -LiteralPath $backupFile) { throw 'Backup file already exists; refusing to overwrite it.' }
+    docker compose cp senseguard:/data/senseguard.db $backupFile
+    if ($LASTEXITCODE -ne 0) { throw 'Database copy failed.' }
+} finally {
+    docker compose start senseguard
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restart SenseGuard; check the Compose service.' }
+}
 ```
 
-Keep the backup protected and out of source control. Restore only to a separate test location and verify it before relying on recovery. Backup/restore has not been validated in this engineering pass.
+Keep the backup protected and out of source control. Restore only to a new, separate test directory; never copy a backup over the live volume. Check the restored copy with `sqlite3 "<path-to-restored-file>" "PRAGMA integrity_check;"` and confirm it prints `ok`. Backup/restore against the running Compose volume has not been validated in this engineering pass.
 
 ## Logs and troubleshooting
 
@@ -179,31 +274,30 @@ Logs omit sensing coordinates/data and bearer tokens. They may include authentic
 
 ## Kubernetes (preparation only)
 
-Files in `k8s/` define namespace, policy ConfigMap, internal OPA Deployment/Service, a 1 GiB PVC, and SenseGuard Deployment/Service. SenseGuard uses one replica, the DB at `/data/senseguard.db`, /readyz and /healthz probes, resource requests/limits, and non-root controls. OPA remains ClusterIP/internal.
+Files in `k8s/` define namespace, policy ConfigMap, internal OPA Deployment/Service, a 1 GiB PVC, and SenseGuard Deployment/Service. `k8s/kustomization.yaml` lets you validate or render the complete set with `kubectl kustomize .\k8s`. SenseGuard uses one replica, the DB at `/data/senseguard.db`, `/readyz` and `/healthz` probes, resource requests/limits, and non-root controls. OPA remains ClusterIP/internal.
 
-Create the namespace and ConfigMap first, then create Secrets from protected files before applying the deployments. The Kubernetes profile expects these Secret names and keys:
+Create the namespace first, then create the required Secrets from protected files. The Kustomize set creates the ConfigMap and workloads. The Kubernetes profile expects these Secret names and keys:
 
 ```powershell
 kubectl apply -f .\k8s\namespace.yaml
-kubectl apply -f .\k8s\opa-config.yaml
 kubectl -n senseguard create secret tls senseguard-tls --cert=<api-cert.pem> --key=<api-key.pem>
 kubectl -n senseguard create secret generic opa-server-tls --from-file=tls.crt=<opa-server-cert.pem> --from-file=tls.key=<opa-server-key.pem> --from-file=ca.crt=<opa-ca.pem>
 kubectl -n senseguard create secret generic senseguard-to-opa-client --from-file=tls.crt=<client-cert.pem> --from-file=tls.key=<client-key.pem> --from-file=ca.crt=<opa-ca.pem>
 kubectl -n senseguard create secret generic senseguard-consumer-credentials --from-file=tokens=<protected-token-map.json>
+kubectl apply -k .\k8s
 ```
 
-The OPA server certificate needs `DNS:opa` and `DNS:opa.senseguard.svc`; the API certificate needs the approved client-facing DNS SAN. The token-map JSON maps consumer IDs to unique random tokens of at least 32 characters. Configure Kubernetes Secret encryption at rest and least-privilege RBAC. These example commands are instructions only and have not been run.
+The OPA client certificate subject must be exactly `CN=senseguard-api`. The OPA server certificate must include `DNS:opa` and `DNS:opa.senseguard.svc`; the API certificate must match the DNS name used by its clients. Keep certificate private keys and token files outside the repository. `kubectl kustomize .\k8s` renders locally without contacting a cluster; schema validation and cluster behavior still need verification against the target Kubernetes version.
+
+The token-map JSON maps consumer IDs to unique random tokens of at least 32 characters. Configure Kubernetes Secret encryption at rest and least-privilege RBAC. These example commands are instructions only and have not been run.
 
 The PVC leaves `storageClassName` unset, so the cluster needs a default dynamic StorageClass. The storage driver must support `fsGroup: 65532`. The app and OPA require externally created TLS Secrets and a consumer-credentials Secret; no secret material is included in this repository. OPA requires a client certificate and validates it against its configured CA. NetworkPolicy restricts OPA ingress to SenseGuard pods, subject to CNI enforcement. The app Service is ClusterIP-only. No ingress is configured.
 
 Future commands only — **NOT EXECUTED** (they change a cluster):
 
 ```powershell
-kubectl apply -f .\k8s\namespace.yaml
-kubectl apply -f .\k8s\opa-config.yaml
-kubectl apply -f .\k8s\opa-deployment.yaml
-kubectl apply -f .\k8s\senseguard-pvc.yaml
-kubectl apply -f .\k8s\senseguard-deployment.yaml
+# After the namespace, ConfigMap, and required Secrets above exist:
+kubectl apply -k .\k8s
 kubectl -n senseguard rollout status deployment/opa
 kubectl -n senseguard rollout status deployment/senseguard
 kubectl -n senseguard port-forward svc/senseguard 8443:443
@@ -229,4 +323,5 @@ See `DEPLOYMENT_CHECKLIST.md` first. No Kubernetes deployment was performed.
 - `policy/`: OPA rules and tests.
 - `Dockerfile`, `docker-compose.yml`: local container configuration.
 - `k8s/`: cluster resources and persistent storage.
+- `docs/assets/`: compressed README hero and privacy-mode illustrations.
 - `DEPLOYMENT_CHECKLIST.md`, `SECURITY_PRIVACY_REVIEW.md`, `VERIFICATION_REPORT.md`: review material.
